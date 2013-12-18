@@ -663,6 +663,15 @@ bool migrate_rdma_pin_all(void)
     return s->enabled_capabilities[MIGRATION_CAPABILITY_RDMA_PIN_ALL];
 }
 
+bool migrate_postcopy_ram(void)
+{
+    MigrationState *s;
+
+    s = migrate_get_current();
+
+    return s->enabled_capabilities[MIGRATION_CAPABILITY_X_POSTCOPY_RAM];
+}
+
 bool migrate_auto_converge(void)
 {
     MigrationState *s;
