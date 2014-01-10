@@ -442,6 +442,7 @@ ram_addr_t migration_bitmap_find_and_reset_dirty(MemoryRegion *mr,
 
     if (next < size) {
         clear_bit(next, migration_bitmap);
+        assert(migration_dirty_pages > 0);
         migration_dirty_pages--;
     }
     *bitoffset = next;
