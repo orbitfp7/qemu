@@ -997,7 +997,9 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     return 0;
 }
 
-static uint64_t ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size)
+static void ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size,
+                             uint64_t *non_postcopiable_pending,
+                             uint64_t *postcopiable_pending)
 {
     uint64_t remaining_size;
 
@@ -1009,7 +1011,9 @@ static uint64_t ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size)
         qemu_mutex_unlock_iothread();
         remaining_size = ram_save_remaining() * TARGET_PAGE_SIZE;
     }
-    return remaining_size;
+
+    *non_postcopiable_pending = 0;
+    *postcopiable_pending = remaining_size;
 }
 
 static int load_xbzrle(QEMUFile *f, ram_addr_t addr, void *host)
@@ -1204,6 +1208,12 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
     return ret;
 }
 
+/* RAM's always up for postcopying */
+static bool ram_can_postcopy(void *opaque)
+{
+    return true;
+}
+
 static SaveVMHandlers savevm_ram_handlers = {
     .save_live_setup = ram_save_setup,
     .save_live_iterate = ram_save_iterate,
@@ -1211,6 +1221,7 @@ static SaveVMHandlers savevm_ram_handlers = {
     .save_live_pending = ram_save_pending,
     .load_state = ram_load,
     .cancel = ram_migration_cancel,
+    .can_postcopy = ram_can_postcopy,
 };
 
 void ram_mig_init(void)
