@@ -1273,7 +1273,9 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     return 0;
 }
 
-static uint64_t ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size)
+static void ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size,
+                             uint64_t *non_postcopiable_pending,
+                             uint64_t *postcopiable_pending)
 {
     uint64_t remaining_size;
 
@@ -1287,7 +1289,9 @@ static uint64_t ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size)
         qemu_mutex_unlock_iothread();
         remaining_size = ram_save_remaining() * TARGET_PAGE_SIZE;
     }
-    return remaining_size;
+
+    *non_postcopiable_pending = 0;
+    *postcopiable_pending = remaining_size;
 }
 
 static int load_xbzrle(QEMUFile *f, ram_addr_t addr, void *host)
