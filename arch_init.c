@@ -1192,6 +1192,12 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
     return ret;
 }
 
+/* RAM's always up for postcopying */
+static bool ram_can_postcopy(void *opaque)
+{
+    return true;
+}
+
 static SaveVMHandlers savevm_ram_handlers = {
     .save_live_setup = ram_save_setup,
     .save_live_iterate = ram_save_iterate,
@@ -1199,6 +1205,7 @@ static SaveVMHandlers savevm_ram_handlers = {
     .save_live_pending = ram_save_pending,
     .load_state = ram_load,
     .cancel = ram_migration_cancel,
+    .can_postcopy = ram_can_postcopy,
 };
 
 void ram_mig_init(void)
