@@ -950,10 +950,20 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f)
     qemu_fflush(f);
 }
 
-uint64_t qemu_savevm_state_pending(QEMUFile *f, uint64_t max_size)
+/* Give an estimate of the amount left to be transferred,
+ * the result is split into the amount for units that can and
+ * for units that can't do postcopy.
+ */
+void qemu_savevm_state_pending(QEMUFile *f, uint64_t max_size,
+                               uint64_t *res_non_postcopiable,
+                               uint64_t *res_postcopiable)
 {
     SaveStateEntry *se;
-    uint64_t ret = 0;
+    uint64_t tmp_non_postcopiable, tmp_postcopiable;
+
+    *res_non_postcopiable = 0;
+    *res_postcopiable = 0;
+
 
     QTAILQ_FOREACH(se, &savevm_handlers, entry) {
         if (!se->ops || !se->ops->save_live_pending) {
@@ -964,9 +974,12 @@ uint64_t qemu_savevm_state_pending(QEMUFile *f, uint64_t max_size)
                 continue;
             }
         }
-        ret += se->ops->save_live_pending(f, se->opaque, max_size);
+        se->ops->save_live_pending(f, se->opaque, max_size,
+                                   &tmp_non_postcopiable, &tmp_postcopiable);
+
+        *res_postcopiable += tmp_postcopiable;
+        *res_non_postcopiable += tmp_non_postcopiable;
     }
-    return ret;
 }
 
 void qemu_savevm_state_cancel(void)
