@@ -78,6 +78,7 @@ MigrationIncomingState *migration_incoming_state_new(QEMUFile* f)
 {
     mis_current = g_malloc0(sizeof(MigrationIncomingState));
     mis_current->file = f;
+    qemu_mutex_init(&mis_current->rp_mutex);
 
     return mis_current;
 }
@@ -86,6 +87,50 @@ void migration_incoming_state_destroy(void)
 {
     g_free(mis_current);
     mis_current = NULL;
+}
+
+/*
+ * Send a message on the return channel back to the source
+ * of the migration.
+ */
+void migrate_send_rp_message(MigrationIncomingState *mis,
+                             enum mig_rpcomm_cmd cmd,
+                             uint16_t len, uint8_t *data)
+{
+    trace_migrate_send_rp_message((int)cmd, len);
+    qemu_mutex_lock(&mis->rp_mutex);
+    qemu_put_be16(mis->return_path, (unsigned int)cmd);
+    qemu_put_be16(mis->return_path, len);
+    qemu_put_buffer(mis->return_path, data, len);
+    qemu_fflush(mis->return_path);
+    qemu_mutex_unlock(&mis->rp_mutex);
+}
+
+/*
+ * Send a 'SHUT' message on the return channel with the given value
+ * to indicate that we've finished with the RP.  None-0 value indicates
+ * error.
+ */
+void migrate_send_rp_shut(MigrationIncomingState *mis,
+                          uint32_t value)
+{
+    uint32_t buf;
+
+    buf = cpu_to_be32(value);
+    migrate_send_rp_message(mis, MIG_RP_CMD_SHUT, 4, (uint8_t *)&buf);
+}
+
+/*
+ * Send a 'PONG' message on the return channel with the given value
+ * (normally in response to a 'PING')
+ */
+void migrate_send_rp_pong(MigrationIncomingState *mis,
+                          uint32_t value)
+{
+    uint32_t buf;
+
+    buf = cpu_to_be32(value);
+    migrate_send_rp_message(mis, MIG_RP_CMD_PONG, 4, (uint8_t *)&buf);
 }
 
 void qemu_start_incoming_migration(const char *uri, Error **errp)
