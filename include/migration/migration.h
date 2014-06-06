@@ -42,12 +42,20 @@ struct MigrationParams {
     bool shared;
 };
 
+/* Messages sent on the return path from destination to source */
+enum mig_rp_message_type {
+    MIG_RP_MSG_INVALID = 0,  /* Must be 0 */
+    MIG_RP_MSG_SHUT,         /* sibling will not send any more RP messages */
+    MIG_RP_MSG_PONG,         /* Response to a PING; data (seq: be32 ) */
+};
+
 typedef QLIST_HEAD(, LoadStateEntry) LoadStateEntry_Head;
 /* State for the incoming migration */
 struct MigrationIncomingState {
     QEMUFile *file;
 
     QEMUFile *return_path;
+    QemuMutex      rp_mutex;    /* We send replies from multiple threads */
 
     /* See savevm.c */
     LoadStateEntry_Head loadvm_handlers;
@@ -178,6 +186,15 @@ bool migrate_use_compression(void);
 int migrate_compress_level(void);
 int migrate_compress_threads(void);
 int migrate_decompress_threads(void);
+
+/* Sending on the return path - generic and then for each message type */
+void migrate_send_rp_message(MigrationIncomingState *mis,
+                             enum mig_rp_message_type message_type,
+                             uint16_t len, void *data);
+void migrate_send_rp_shut(MigrationIncomingState *mis,
+                          uint32_t value);
+void migrate_send_rp_pong(MigrationIncomingState *mis,
+                          uint32_t value);
 
 void ram_control_before_iterate(QEMUFile *f, uint64_t flags);
 void ram_control_after_iterate(QEMUFile *f, uint64_t flags);

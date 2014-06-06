@@ -1071,7 +1071,7 @@ static int loadvm_process_command(QEMUFile *f)
                          tmp32);
             return -1;
         }
-        /* migrate_send_rp_pong(mis, tmp32); TODO: gets added later */
+        migrate_send_rp_pong(mis, tmp32);
         break;
 
     default:
