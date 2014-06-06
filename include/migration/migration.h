@@ -40,6 +40,13 @@ struct MigrationParams {
     bool shared;
 };
 
+/* Commands sent on the return path from destination to source*/
+enum mig_rpcomm_cmd {
+    MIG_RPCOMM_INVALID = 0,  /* Must be 0 */
+    MIG_RPCOMM_SHUT,         /* sibling will not send any more RP messages */
+    MIG_RPCOMM_ACK,          /* data (seq: be32 ) */
+    MIG_RPCOMM_AFTERLASTVALID
+};
 typedef struct MigrationState MigrationState;
 
 /* State for the incoming migration */
@@ -47,6 +54,7 @@ struct MigrationIncomingState {
     QEMUFile *file;
 
     QEMUFile *return_path;
+    QemuMutex      rp_mutex;    /* We send replies from multiple threads */
 };
 
 MigrationIncomingState *migration_incoming_get_current(void);
@@ -167,6 +175,16 @@ int migrate_use_xbzrle(void);
 int64_t migrate_xbzrle_cache_size(void);
 
 int64_t xbzrle_cache_resize(int64_t new_size);
+
+/* Sending on the return path - generic and then for each message type */
+void migrate_send_rp_message(MigrationIncomingState *mis,
+                             enum mig_rpcomm_cmd cmd,
+                             uint16_t len, uint8_t *data);
+void migrate_send_rp_shut(MigrationIncomingState *mis,
+                          uint32_t value);
+void migrate_send_rp_ack(MigrationIncomingState *mis,
+                         uint32_t value);
+
 
 void ram_control_before_iterate(QEMUFile *f, uint64_t flags);
 void ram_control_after_iterate(QEMUFile *f, uint64_t flags);
