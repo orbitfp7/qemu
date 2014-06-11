@@ -28,6 +28,11 @@ int postcopy_send_discard_bitmap(MigrationState *ms);
 int postcopy_ram_discard_range(MigrationIncomingState *mis, uint8_t *start,
                                uint8_t *end);
 
+/*
+ * Make all of RAM sensitive to accesses to areas that haven't yet been written
+ * and wire up anything necessary to deal with it.
+ */
+int postcopy_ram_enable_notify(MigrationIncomingState *mis);
 
 /*
  * Initialise postcopy-ram, setting the RAM to a state where we can go into
