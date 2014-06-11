@@ -1304,6 +1304,15 @@ static int loadvm_postcopy_ram_handle_listen(MigrationIncomingState *mis)
 
     mis->postcopy_ram_state = POSTCOPY_RAM_INCOMING_LISTENING;
 
+    /*
+     * Sensitise RAM - can now generate requests for blocks that don't exist
+     * However, at this point the CPU shouldn't be running, and the IO
+     * shouldn't be doing anything yet so don't actually expect requests
+     */
+    if (postcopy_ram_enable_notify(mis)) {
+        return -1;
+    }
+
     /* TODO start up the postcopy listening thread */
     return 0;
 }
