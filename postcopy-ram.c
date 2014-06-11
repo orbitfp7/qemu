@@ -388,9 +388,38 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
     return 0;
 }
 
+/*
+ * Mark the given area of RAM as requiring notification to unwritten areas
+ * Used as a  callback on qemu_ram_foreach_block.
+ *   host_addr: Base of area to mark
+ *   offset: Offset in the whole ram arena
+ *   length: Length of the section
+ *   opaque: Unused
+ * Returns 0 on success
+ */
+static int postcopy_ram_sensitise_area(const char *block_name, void *host_addr,
+                                       ram_addr_t offset, ram_addr_t length,
+                                       void *opaque)
+{
+    if (madvise(host_addr, length, MADV_USERFAULT)) {
+        perror("postcopy_ram_sensitise_area");
+        return -1;
+    }
+    return 0;
+}
+
+int postcopy_ram_enable_notify(MigrationIncomingState *mis)
+{
+    /* Mark so that we get notified of accesses to unwritten areas */
+    if (qemu_ram_foreach_block(postcopy_ram_sensitise_area, NULL)) {
+        return -1;
+    }
+
+    return 0;
+}
+
 #else
 /* No target OS support, stubs just fail */
-
 int postcopy_ram_hosttest(void)
 {
     error_report("postcopy_ram_hosttest: No OS support");
@@ -423,6 +452,11 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
     return -1;
 }
 
+int postcopy_ram_enable_notify(MigrationIncomingState *mis)
+{
+    fprintf(stderr, "postcopy_ram_enable_notify: No OS support\n");
+    return -1;
+}
 #endif
 
 /* ------------------------------------------------------------------------- */
