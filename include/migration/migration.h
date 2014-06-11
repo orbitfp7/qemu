@@ -84,6 +84,9 @@ struct MigrationIncomingState {
 
     PostcopyState postcopy_state;
 
+    QemuThread     fault_thread;
+    QemuSemaphore  fault_thread_sem;
+
     /* For the kernel to send us notifications */
     int            userfault_fd;
     QEMUFile *return_path;
