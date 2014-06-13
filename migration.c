@@ -65,6 +65,7 @@ static NotifierList migration_state_notifiers =
    migrations at once.  For now we don't need to add
    dynamic creation of migration */
 
+/* For outgoing */
 MigrationState *migrate_get_current(void)
 {
     static MigrationState current_migration = {
@@ -75,6 +76,28 @@ MigrationState *migrate_get_current(void)
     };
 
     return &current_migration;
+}
+
+/* For incoming */
+static MigrationIncomingState *mis_current;
+
+MigrationIncomingState *migration_incoming_get_current(void)
+{
+    return mis_current;
+}
+
+MigrationIncomingState *migration_incoming_state_init(QEMUFile* f)
+{
+    mis_current = g_malloc0(sizeof(MigrationIncomingState));
+    mis_current->file = f;
+
+    return mis_current;
+}
+
+void migration_incoming_state_destroy(void)
+{
+    g_free(mis_current);
+    mis_current = NULL;
 }
 
 void qemu_start_incoming_migration(const char *uri, Error **errp)
@@ -106,9 +129,14 @@ static void process_incoming_migration_co(void *opaque)
     Error *local_err = NULL;
     int ret;
 
+    migration_incoming_state_init(f);
+
     ret = qemu_loadvm_state(f);
+
     qemu_fclose(f);
     free_xbzrle_decoded_buf();
+    migration_incoming_state_destroy();
+
     if (ret < 0) {
         error_report("load of migration failed: %s", strerror(-ret));
         exit(EXIT_FAILURE);
