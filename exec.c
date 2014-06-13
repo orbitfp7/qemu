@@ -3067,14 +3067,20 @@ bool cpu_physical_memory_is_io(hwaddr phys_addr)
              memory_region_is_romd(mr));
 }
 
-void qemu_ram_foreach_block(RAMBlockIterFunc func, void *opaque)
+int qemu_ram_foreach_block(RAMBlockIterFunc func, void *opaque)
 {
     RAMBlock *block;
+    int ret = 0;
 
     rcu_read_lock();
     QLIST_FOREACH_RCU(block, &ram_list.blocks, next) {
-        func(block->host, block->offset, block->used_length, opaque);
+        ret = func(block->idstr, block->host, block->offset,
+                   block->used_length, opaque);
+        if (ret) {
+            break;
+        }
     }
     rcu_read_unlock();
+    return ret;
 }
 #endif
