@@ -14,6 +14,7 @@ typedef struct Visitor Visitor;
 
 struct Monitor;
 typedef struct Monitor Monitor;
+typedef struct MigrationIncomingState MigrationIncomingState;
 typedef struct MigrationParams MigrationParams;
 
 typedef struct Property Property;
@@ -44,6 +45,7 @@ typedef struct PixelFormat PixelFormat;
 typedef struct QemuConsole QemuConsole;
 typedef struct CharDriverState CharDriverState;
 typedef struct MACAddr MACAddr;
+typedef struct MigrationIncomingState MigrationIncomingState;
 typedef struct NetClientState NetClientState;
 typedef struct I2CBus I2CBus;
 typedef struct ISABus ISABus;
