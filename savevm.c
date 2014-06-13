@@ -592,6 +592,25 @@ static void vmstate_save(QEMUFile *f, SaveStateEntry *se)
     vmstate_save_state(f, se->vmsd, se->opaque);
 }
 
+
+/* Send a 'QEMU_VM_COMMAND' type element with the command
+ * and associated data.
+ */
+void qemu_savevm_command_send(QEMUFile *f,
+                              enum qemu_vm_cmd command,
+                              uint16_t len,
+                              uint8_t *data)
+{
+    uint32_t tmp = (uint16_t)command;
+    qemu_put_byte(f, QEMU_VM_COMMAND);
+    qemu_put_be16(f, tmp);
+    qemu_put_be16(f, len);
+    if (len) {
+        qemu_put_buffer(f, data, len);
+    }
+    qemu_fflush(f);
+}
+
 bool qemu_savevm_state_blocked(Error **errp)
 {
     SaveStateEntry *se;
@@ -881,6 +900,29 @@ static SaveStateEntry *find_se(const char *idstr, int instance_id)
     return NULL;
 }
 
+/*
+ * Process an incoming 'QEMU_VM_COMMAND'
+ * negative return on error (will issue error message)
+ */
+static int loadvm_process_command(QEMUFile *f)
+{
+    uint16_t com;
+    uint16_t len;
+
+    com = qemu_get_be16(f);
+    len = qemu_get_be16(f);
+
+    /* fprintf(stderr,"loadvm_process_command: com=0x%x len=%d\n", com,len); */
+    switch (com) {
+
+    default:
+        error_report("VM_COMMAND 0x%x unknown (len 0x%x)", com, len);
+        return -1;
+    }
+
+    return 0;
+}
+
 typedef struct LoadStateEntry {
     QLIST_ENTRY(LoadStateEntry) entry;
     SaveStateEntry *se;
@@ -984,6 +1026,12 @@ int qemu_loadvm_state(QEMUFile *f)
             if (ret < 0) {
                 fprintf(stderr, "qemu: warning: error while loading state section id %d\n",
                         section_id);
+                goto out;
+            }
+            break;
+        case QEMU_VM_COMMAND:
+            ret = loadvm_process_command(f);
+            if (ret < 0) {
                 goto out;
             }
             break;

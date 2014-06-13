@@ -81,6 +81,13 @@ void do_info_snapshots(Monitor *mon, const QDict *qdict);
 
 void qemu_announce_self(void);
 
+/* Subcommands for QEMU_VM_COMMAND */
+enum qemu_vm_cmd {
+    QEMU_VM_CMD_INVALID = 0,   /* Must be 0 */
+
+    QEMU_VM_CMD_AFTERLASTVALID
+};
+
 bool qemu_savevm_state_blocked(Error **errp);
 void qemu_savevm_state_begin(QEMUFile *f,
                              const MigrationParams *params);
@@ -88,6 +95,8 @@ int qemu_savevm_state_iterate(QEMUFile *f);
 void qemu_savevm_state_complete(QEMUFile *f);
 void qemu_savevm_state_cancel(void);
 uint64_t qemu_savevm_state_pending(QEMUFile *f, uint64_t max_size);
+void qemu_savevm_command_send(QEMUFile *f, enum qemu_vm_cmd command,
+                              uint16_t len, uint8_t *data);
 int qemu_loadvm_state(QEMUFile *f);
 
 /* SLIRP */
