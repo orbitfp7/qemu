@@ -53,9 +53,12 @@
 #include "hw/acpi/acpi.h"
 #include "qemu/host-utils.h"
 
+// #define DEBUG_ARCH_INIT
 #ifdef DEBUG_ARCH_INIT
 #define DPRINTF(fmt, ...) \
-    do { fprintf(stdout, "arch_init: " fmt, ## __VA_ARGS__); } while (0)
+    do { fprintf(stderr,  "arch_init@%" PRId64 " " fmt "\n", \
+                          qemu_clock_get_ms(QEMU_CLOCK_REALTIME), \
+                          ## __VA_ARGS__); } while (0)
 #else
 #define DPRINTF(fmt, ...) \
     do { } while (0)

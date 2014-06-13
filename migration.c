@@ -26,6 +26,18 @@
 #include "qmp-commands.h"
 #include "trace.h"
 
+//#define DEBUG_MIGRATION
+
+#ifdef DEBUG_MIGRATION
+#define DPRINTF(fmt, ...) \
+    do { fprintf(stderr, "migration@%" PRId64 " " fmt "\n", \
+                          qemu_clock_get_ms(QEMU_CLOCK_REALTIME), \
+                          ## __VA_ARGS__); } while (0)
+#else
+#define DPRINTF(fmt, ...) \
+    do { } while (0)
+#endif
+
 enum {
     MIG_STATE_ERROR = -1,
     MIG_STATE_NONE,

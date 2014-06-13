@@ -43,6 +43,16 @@
 #include "block/snapshot.h"
 #include "block/qapi.h"
 
+#ifdef DEBUG_SAVEVM
+#define DPRINTF(fmt, ...) \
+    do { fprintf(stderr, "savevm@%" PRId64 " " fmt "\n", \
+                          qemu_clock_get_ms(QEMU_CLOCK_REALTIME), \
+                          ## __VA_ARGS__); } while (0)
+#else
+#define DPRINTF(fmt, ...) \
+    do { } while (0)
+#endif
+
 
 #ifndef ETH_P_RARP
 #define ETH_P_RARP 0x8035
