@@ -686,6 +686,23 @@ static bool check_section_footer(QEMUFile *f, SaveStateEntry *se)
     return true;
 }
 
+/* Send a 'QEMU_VM_COMMAND' type element with the command
+ * and associated data.
+ */
+void qemu_savevm_command_send(QEMUFile *f,
+                              enum qemu_vm_cmd command,
+                              uint16_t len,
+                              uint8_t *data)
+{
+    qemu_put_byte(f, QEMU_VM_COMMAND);
+    qemu_put_be16(f, (uint16_t)command);
+    qemu_put_be16(f, len);
+    if (len) {
+        qemu_put_buffer(f, data, len);
+    }
+    qemu_fflush(f);
+}
+
 bool qemu_savevm_state_blocked(Error **errp)
 {
     SaveStateEntry *se;
@@ -982,6 +999,29 @@ static SaveStateEntry *find_se(const char *idstr, int instance_id)
     return NULL;
 }
 
+/*
+ * Process an incoming 'QEMU_VM_COMMAND'
+ * negative return on error (will issue error message)
+ */
+static int loadvm_process_command(QEMUFile *f)
+{
+    uint16_t cmd;
+    uint16_t len;
+
+    cmd = qemu_get_be16(f);
+    len = qemu_get_be16(f);
+
+    trace_loadvm_process_command(cmd, len);
+    switch (cmd) {
+
+    default:
+        error_report("VM_COMMAND 0x%x unknown (len 0x%x)", cmd, len);
+        return -1;
+    }
+
+    return 0;
+}
+
 struct LoadStateEntry {
     QLIST_ENTRY(LoadStateEntry) entry;
     SaveStateEntry *se;
@@ -1111,6 +1151,12 @@ int qemu_loadvm_state(QEMUFile *f)
             }
             if (!check_section_footer(f, le->se)) {
                 ret = -EINVAL;
+                goto out;
+            }
+            break;
+        case QEMU_VM_COMMAND:
+            ret = loadvm_process_command(f);
+            if (ret < 0) {
                 goto out;
             }
             break;
