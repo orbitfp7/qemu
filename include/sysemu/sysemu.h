@@ -85,6 +85,8 @@ void qemu_announce_self(void);
 /* Subcommands for QEMU_VM_COMMAND */
 enum qemu_vm_cmd {
     QEMU_VM_CMD_INVALID = 0,   /* Must be 0 */
+    QEMU_VM_CMD_OPENRP,        /* Tell the dest to open the Return path */
+    QEMU_VM_CMD_REQACK,        /* Request an ACK on the RP */
 
     QEMU_VM_CMD_AFTERLASTVALID
 };
@@ -98,6 +100,8 @@ void qemu_savevm_state_cancel(void);
 uint64_t qemu_savevm_state_pending(QEMUFile *f, uint64_t max_size);
 void qemu_savevm_command_send(QEMUFile *f, enum qemu_vm_cmd command,
                               uint16_t len, uint8_t *data);
+void qemu_savevm_send_reqack(QEMUFile *f, uint32_t value);
+void qemu_savevm_send_openrp(QEMUFile *f);
 int qemu_loadvm_state(QEMUFile *f);
 
 /* SLIRP */
