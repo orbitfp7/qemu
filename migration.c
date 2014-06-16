@@ -488,7 +488,7 @@ bool migration_has_failed(MigrationState *s)
             s->state == MIG_STATE_ERROR);
 }
 
-static MigrationState *migrate_init(const MigrationParams *params)
+MigrationState *migrate_init(const MigrationParams *params)
 {
     MigrationState *s = migrate_get_current();
     int64_t bandwidth_limit = s->bandwidth_limit;

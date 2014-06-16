@@ -16,6 +16,7 @@ struct Monitor;
 typedef struct Monitor Monitor;
 typedef struct MigrationIncomingState MigrationIncomingState;
 typedef struct MigrationParams MigrationParams;
+typedef struct MigrationState MigrationState;
 
 typedef struct Property Property;
 typedef struct PropertyInfo PropertyInfo;
