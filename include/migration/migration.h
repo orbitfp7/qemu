@@ -46,6 +46,8 @@ typedef struct MigrationState MigrationState;
 /* State for the incoming migration */
 struct MigrationIncomingState {
     QEMUFile *file;
+
+    QEMUFile *return_path;
 };
 
 MigrationIncomingState *migration_incoming_get_current(void);

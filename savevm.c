@@ -620,6 +620,20 @@ void qemu_savevm_command_send(QEMUFile *f,
     qemu_fflush(f);
 }
 
+void qemu_savevm_send_ping(QEMUFile *f, uint32_t value)
+{
+    uint32_t buf;
+
+    trace_savevm_send_ping(value);
+    buf = cpu_to_be32(value);
+    qemu_savevm_command_send(f, MIG_CMD_PING, 4, (uint8_t *)&buf);
+}
+
+void qemu_savevm_send_open_return_path(QEMUFile *f)
+{
+    qemu_savevm_command_send(f, MIG_CMD_OPEN_RETURN_PATH, 0, NULL);
+}
+
 bool qemu_savevm_state_blocked(Error **errp)
 {
     SaveStateEntry *se;
@@ -945,20 +959,65 @@ static SaveStateEntry *find_se(const char *idstr, int instance_id)
     return NULL;
 }
 
+static int loadvm_process_command_simple_lencheck(const char *name,
+                                                  unsigned int actual,
+                                                  unsigned int expected)
+{
+    if (actual != expected) {
+        error_report("%s received with bad length - expecting %d, got %d",
+                     name, expected, actual);
+        return -1;
+    }
+
+    return 0;
+}
+
 /*
  * Process an incoming 'QEMU_VM_COMMAND'
  * negative return on error (will issue error message)
  */
 static int loadvm_process_command(QEMUFile *f)
 {
+    MigrationIncomingState *mis = migration_incoming_get_current();
     uint16_t com;
     uint16_t len;
+    uint32_t tmp32;
 
     com = qemu_get_be16(f);
     len = qemu_get_be16(f);
 
     trace_loadvm_process_command(com, len);
     switch (com) {
+    case MIG_CMD_OPEN_RETURN_PATH:
+        if (loadvm_process_command_simple_lencheck("CMD_OPEN_RETURN_PATH",
+                                                   len, 0)) {
+            return -1;
+        }
+        if (mis->return_path) {
+            error_report("CMD_OPEN_RETURN_PATH called when RP already open");
+            /* Not really a problem, so don't give up */
+            return 0;
+        }
+        mis->return_path = qemu_file_get_return_path(f);
+        if (!mis->return_path) {
+            error_report("CMD_OPEN_RETURN_PATH failed");
+            return -1;
+        }
+        break;
+
+    case MIG_CMD_PING:
+        if (loadvm_process_command_simple_lencheck("CMD_PING", len, 4)) {
+            return -1;
+        }
+        tmp32 = qemu_get_be32(f);
+        trace_loadvm_process_command_ping(tmp32);
+        if (!mis->return_path) {
+            error_report("CMD_PING (0x%x) received with no return path",
+                         tmp32);
+            return -1;
+        }
+        /* migrate_send_rp_pong(mis, tmp32); TODO: gets added later */
+        break;
 
     default:
         error_report("VM_COMMAND 0x%x unknown (len 0x%x)", com, len);
