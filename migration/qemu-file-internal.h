@@ -48,6 +48,8 @@ struct QEMUFile {
     unsigned int iovcnt;
 
     int last_error;
+
+    struct QEMUFile *return_path;
 };
 
 #endif

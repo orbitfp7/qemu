@@ -96,6 +96,45 @@ static int socket_shutdown(void *opaque, bool rd, bool wr)
     }
 }
 
+/*
+ * Give a QEMUFile* off the same socket but data in the opposite
+ * direction.
+ */
+static QEMUFile *socket_dup_return_path(void *opaque)
+{
+    QEMUFileSocket *qfs = opaque;
+    int revfd;
+    bool this_is_read;
+    QEMUFile *result;
+
+    /* We should only be called once to get a RP on a file */
+    assert(!qfs->file->return_path);
+
+    if (qemu_file_get_error(qfs->file)) {
+        /* If the forward file is in error, don't try and open a return */
+        return NULL;
+    }
+
+    /* I don't think there's a better way to tell which direction 'this' is */
+    this_is_read = qfs->file->ops->get_buffer != NULL;
+
+    revfd = dup(qfs->fd);
+    if (revfd == -1) {
+        error_report("Error duplicating fd for return path: %s",
+                      strerror(errno));
+        return NULL;
+    }
+
+    result = qemu_fopen_socket(revfd, this_is_read ? "wb" : "rb");
+    qfs->file->return_path = result;
+
+    if (!result) {
+        close(revfd);
+    }
+
+    return result;
+}
+
 static ssize_t unix_writev_buffer(void *opaque, struct iovec *iov, int iovcnt,
                                   int64_t pos)
 {
@@ -204,18 +243,19 @@ QEMUFile *qemu_fdopen(int fd, const char *mode)
 }
 
 static const QEMUFileOps socket_read_ops = {
-    .get_fd     = socket_get_fd,
-    .get_buffer = socket_get_buffer,
-    .close      = socket_close,
-    .shut_down  = socket_shutdown
-
+    .get_fd          = socket_get_fd,
+    .get_buffer      = socket_get_buffer,
+    .close           = socket_close,
+    .shut_down       = socket_shutdown,
+    .get_return_path = socket_dup_return_path
 };
 
 static const QEMUFileOps socket_write_ops = {
-    .get_fd        = socket_get_fd,
-    .writev_buffer = socket_writev_buffer,
-    .close         = socket_close,
-    .shut_down     = socket_shutdown
+    .get_fd          = socket_get_fd,
+    .writev_buffer   = socket_writev_buffer,
+    .close           = socket_close,
+    .shut_down       = socket_shutdown,
+    .get_return_path = socket_dup_return_path
 };
 
 QEMUFile *qemu_fopen_socket(int fd, const char *mode)
