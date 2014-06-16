@@ -60,6 +60,7 @@ typedef struct PCIEAERLog PCIEAERLog;
 typedef struct PCIEAERErr PCIEAERErr;
 typedef struct PCIEPort PCIEPort;
 typedef struct PCIESlot PCIESlot;
+typedef struct QEMUSizedBuffer QEMUSizedBuffer;
 typedef struct MSIMessage MSIMessage;
 typedef struct SerialState SerialState;
 typedef struct PCMCIACardState PCMCIACardState;
