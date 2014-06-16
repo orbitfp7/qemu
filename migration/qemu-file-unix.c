@@ -96,6 +96,52 @@ static int socket_shutdown(void *opaque, bool rd, bool wr)
     }
 }
 
+/*
+ * Give a QEMUFile* off the same socket but data in the opposite
+ * direction.
+ */
+static QEMUFile *socket_dup_return_path(void *opaque)
+{
+    QEMUFileSocket *qfs = opaque;
+    int revfd;
+    bool this_is_read;
+    QEMUFile *result;
+
+    if (qemu_file_get_error(qfs->file)) {
+        /* If the forward file is in error, don't try and open a return */
+        return NULL;
+    }
+
+    /* I don't think there's a better way to tell which direction 'this' is */
+    this_is_read = qfs->file->ops->get_buffer != NULL;
+
+    revfd = dup(qfs->fd);
+    if (revfd == -1) {
+        error_report("Error duplicating fd for return path: %s",
+                      strerror(errno));
+        return NULL;
+    }
+
+    result = qemu_fopen_socket(revfd, this_is_read ? "wb" : "rb");
+
+    if (!result) {
+        close(revfd);
+    }
+
+    if (this_is_read) {
+        /* The qemu_fopen_socket "wb" will mark the socket blocking,
+         * which would be OK for the return path, but the semantics
+         * of non-blocking is that it follows the underlying connection
+         * not the fd number, and thus setting the return path non-blocking
+         * ends up setting the forward path blocking, which we don't want
+         */
+        qemu_set_nonblock(revfd);
+    }
+
+
+    return result;
+}
+
 static ssize_t unix_writev_buffer(void *opaque, struct iovec *iov, int iovcnt,
                                   int64_t pos)
 {
@@ -204,18 +250,19 @@ QEMUFile *qemu_fdopen(int fd, const char *mode)
 }
 
 static const QEMUFileOps socket_read_ops = {
-    .get_fd     = socket_get_fd,
-    .get_buffer = socket_get_buffer,
-    .close      = socket_close,
-    .shut_down  = socket_shutdown
-
+    .get_fd          = socket_get_fd,
+    .get_buffer      = socket_get_buffer,
+    .close           = socket_close,
+    .shut_down       = socket_shutdown,
+    .get_return_path = socket_dup_return_path
 };
 
 static const QEMUFileOps socket_write_ops = {
-    .get_fd        = socket_get_fd,
-    .writev_buffer = socket_writev_buffer,
-    .close         = socket_close,
-    .shut_down     = socket_shutdown
+    .get_fd          = socket_get_fd,
+    .writev_buffer   = socket_writev_buffer,
+    .close           = socket_close,
+    .shut_down       = socket_shutdown,
+    .get_return_path = socket_dup_return_path
 };
 
 QEMUFile *qemu_fopen_socket(int fd, const char *mode)
