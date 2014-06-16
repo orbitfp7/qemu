@@ -85,6 +85,11 @@ typedef size_t (QEMURamSaveFunc)(QEMUFile *f, void *opaque,
                                uint64_t *bytes_sent);
 
 /*
+ * Return a QEMUFile for comms in the opposite direction
+ */
+typedef QEMUFile *(QEMURetPathFunc)(void *opaque);
+
+/*
  * Stop any read or write (depending on flags) on the underlying
  * transport on the QEMUFile.
  * Existing blocking reads/writes must be woken
@@ -102,6 +107,7 @@ typedef struct QEMUFileOps {
     QEMURamHookFunc *after_ram_iterate;
     QEMURamHookFunc *hook_ram_load;
     QEMURamSaveFunc *save_page;
+    QEMURetPathFunc *get_return_path;
     QEMUFileShutdownFunc *shut_down;
 } QEMUFileOps;
 
@@ -192,6 +198,7 @@ int64_t qemu_file_get_rate_limit(QEMUFile *f);
 int qemu_file_get_error(QEMUFile *f);
 void qemu_file_set_error(QEMUFile *f, int ret);
 int qemu_file_shutdown(QEMUFile *f);
+QEMUFile *qemu_file_get_return_path(QEMUFile *f);
 void qemu_fflush(QEMUFile *f);
 void qemu_file_change_blocking(QEMUFile *f, bool block);
 
