@@ -611,6 +611,19 @@ void qemu_savevm_command_send(QEMUFile *f,
     qemu_fflush(f);
 }
 
+void qemu_savevm_send_reqack(QEMUFile *f, uint32_t value)
+{
+    uint32_t buf;
+
+    DPRINTF("send_reqack %d", value);
+    buf = cpu_to_be32(value);
+    qemu_savevm_command_send(f, QEMU_VM_CMD_REQACK, 4, (uint8_t *)&buf);
+}
+
+void qemu_savevm_send_openrp(QEMUFile *f)
+{
+    qemu_savevm_command_send(f, QEMU_VM_CMD_OPENRP, 0, NULL);
+}
 bool qemu_savevm_state_blocked(Error **errp)
 {
     SaveStateEntry *se;
@@ -900,20 +913,64 @@ static SaveStateEntry *find_se(const char *idstr, int instance_id)
     return NULL;
 }
 
+static int loadvm_process_command_simple_lencheck(const char *name,
+                                                  unsigned int actual,
+                                                  unsigned int expected)
+{
+    if (actual != expected) {
+        error_report("%s received with bad length - expecting %d, got %d",
+                     name, expected, actual);
+        return -1;
+    }
+
+    return 0;
+}
+
 /*
  * Process an incoming 'QEMU_VM_COMMAND'
  * negative return on error (will issue error message)
  */
 static int loadvm_process_command(QEMUFile *f)
 {
+    MigrationIncomingState *mis = migration_incoming_get_current();
     uint16_t com;
     uint16_t len;
+    uint32_t tmp32;
 
     com = qemu_get_be16(f);
     len = qemu_get_be16(f);
 
     /* fprintf(stderr,"loadvm_process_command: com=0x%x len=%d\n", com,len); */
     switch (com) {
+    case QEMU_VM_CMD_OPENRP:
+        if (loadvm_process_command_simple_lencheck("CMD_OPENRP", len, 0)) {
+            return -1;
+        }
+        if (mis->return_path) {
+            error_report("CMD_OPENRP called when RP already open");
+            /* Not really a problem, so don't give up */
+            return 0;
+        }
+        mis->return_path = qemu_file_get_return_path(f);
+        if (!mis->return_path) {
+            error_report("CMD_OPENRP failed - could not open return path");
+            return -1;
+        }
+        break;
+
+    case QEMU_VM_CMD_REQACK:
+        if (loadvm_process_command_simple_lencheck("CMD_REQACK", len, 4)) {
+            return -1;
+        }
+        tmp32 = qemu_get_be32(f);
+        DPRINTF("Received REQACK 0x%x", tmp32);
+        if (!mis->return_path) {
+            error_report("CMD_REQACK (0x%x) received with no open return path",
+                         tmp32);
+            return -1;
+        }
+        /* migrate_send_rp_ack(mis, tmp32); TODO: gets added later */
+        break;
 
     default:
         error_report("VM_COMMAND 0x%x unknown (len 0x%x)", com, len);
