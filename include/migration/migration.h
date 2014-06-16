@@ -47,6 +47,8 @@ typedef QLIST_HEAD(, LoadStateEntry) LoadStateEntry_Head;
 struct MigrationIncomingState {
     QEMUFile *file;
 
+    QEMUFile *return_path;
+
     /* See savevm.c */
     LoadStateEntry_Head loadvm_handlers;
 };
