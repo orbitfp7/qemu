@@ -468,7 +468,10 @@ static void migrate_fd_cleanup(void *opaque)
     if (s->file) {
         trace_migrate_fd_cleanup();
         qemu_mutex_unlock_iothread();
-        qemu_thread_join(&s->thread);
+        if (s->started_migration_thread) {
+            qemu_thread_join(&s->thread);
+            s->started_migration_thread = false;
+        }
         qemu_mutex_lock_iothread();
 
         qemu_fclose(s->file);
@@ -1177,6 +1180,19 @@ void migrate_fd_connect(MigrationState *s)
     /* Notify before starting migration thread */
     notifier_list_notify(&migration_state_notifiers, s);
 
+    /* Open the return path; currently for postcopy but other things might
+     * also want it.
+     */
+    if (migrate_postcopy_ram()) {
+        if (open_outgoing_return_path(s)) {
+            error_report("Unable to open return-path for postcopy");
+            migrate_set_state(s, MIG_STATE_SETUP, MIG_STATE_ERROR);
+            migrate_fd_cleanup(s);
+            return;
+        }
+    }
+
     qemu_thread_create(&s->thread, "migration", migration_thread, s,
                        QEMU_THREAD_JOINABLE);
+    s->started_migration_thread = true;
 }
