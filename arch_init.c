@@ -458,6 +458,19 @@ static inline bool migration_bitmap_set_dirty(ram_addr_t addr)
     return ret;
 }
 
+static inline bool migration_bitmap_clear_dirty(ram_addr_t addr)
+{
+    bool ret;
+    int nr = addr >> TARGET_PAGE_BITS;
+
+    ret = test_and_clear_bit(nr, migration_bitmap);
+
+    if (ret) {
+        migration_dirty_pages--;
+    }
+    return ret;
+}
+
 static void migration_bitmap_sync_range(ram_addr_t start, ram_addr_t length)
 {
     ram_addr_t addr;
@@ -658,6 +671,39 @@ static int ram_save_page(QEMUFile *f, RAMBlock* block, ram_addr_t offset,
 }
 
 /*
+ * Unqueue a page from the queue fed by postcopy page requests
+ *
+ * Returns:   The RAMBlock* to transmit from (or NULL if the queue is empty)
+ *      ms:   MigrationState in
+ *  offset:   the byte offset within the RAMBlock for the start of the page
+ * bitoffset: global offset in the dirty/sent bitmaps
+ */
+static RAMBlock *ram_save_unqueue_page(MigrationState *ms, ram_addr_t *offset,
+                                       unsigned long *bitoffset)
+{
+    RAMBlock *result = NULL;
+    qemu_mutex_lock(&ms->src_page_req_mutex);
+    if (!QSIMPLEQ_EMPTY(&ms->src_page_requests)) {
+        struct MigrationSrcPageRequest *entry =
+                                    QSIMPLEQ_FIRST(&ms->src_page_requests);
+        result = entry->rb;
+        *offset = entry->offset;
+        *bitoffset = (entry->offset + entry->rb->offset) >> TARGET_PAGE_BITS;
+
+        if (entry->len > TARGET_PAGE_SIZE) {
+            entry->len -= TARGET_PAGE_SIZE;
+            entry->offset += TARGET_PAGE_SIZE;
+        } else {
+            QSIMPLEQ_REMOVE_HEAD(&ms->src_page_requests, next_req);
+            g_free(entry);
+        }
+    }
+    qemu_mutex_unlock(&ms->src_page_req_mutex);
+
+    return result;
+}
+
+/*
  * Queue the pages for transmission, e.g. a request from postcopy destination
  *   ms: MigrationStatus in which the queue is held
  *   rbname: The RAMBlock the request is for - may be NULL (to mean reuse last)
@@ -718,44 +764,80 @@ int ram_save_queue_pages(MigrationState *ms, const char *rbname,
 
 static int ram_find_and_save_block(QEMUFile *f, bool last_stage)
 {
+    MigrationState *ms = migrate_get_current();
     RAMBlock *block = last_seen_block;
+    RAMBlock *tmpblock;
     ram_addr_t offset = last_offset;
+    ram_addr_t tmpoffset;
     bool complete_round = false;
     int bytes_sent = 0;
-    MemoryRegion *mr;
     unsigned long bitoffset;
 
     if (!block)
         block = QTAILQ_FIRST(&ram_list.blocks);
 
-    while (true) {
-        mr = block->mr;
-        offset = migration_bitmap_find_and_reset_dirty(mr, offset, &bitoffset);
-        if (complete_round && block == last_seen_block &&
-            offset >= last_offset) {
-            break;
-        }
-        if (offset >= block->length) {
-            offset = 0;
-            block = QTAILQ_NEXT(block, next);
-            if (!block) {
-                block = QTAILQ_FIRST(&ram_list.blocks);
-                complete_round = true;
-                ram_bulk_stage = false;
+    while (true) { /* Until we send a block or run out of stuff to send */
+        tmpblock = ram_save_unqueue_page(ms, &tmpoffset, &bitoffset);
+        if (tmpblock) {
+            /* We've got a block from the postcopy queue */
+            DPRINTF("%s: Got postcopy item '%s' offset=%zx bitoffset=%zx",
+                    __func__, tmpblock->idstr, tmpoffset, bitoffset);
+            /* We're sending this page, and since it's postcopy nothing else
+             * will dirty it, and we must make sure it doesn't get sent again.
+             */
+            if (!migration_bitmap_clear_dirty(bitoffset << TARGET_PAGE_BITS)) {
+                DPRINTF("%s: Not dirty for postcopy %s/%zx bito=%zx (sent=%d)",
+                        __func__, tmpblock->idstr, tmpoffset, bitoffset,
+                        test_bit(bitoffset, ms->sentmap));
+                continue;
             }
+            /*
+             * As soon as we start servicing pages out of order, then we have
+             * to kill the bulk stage, since the bulk stage assumes
+             * in (migration_bitmap_find_and_reset_dirty) that every page is
+             * dirty, that's no longer true.
+             */
+            ram_bulk_stage = false;
+            /*
+             * We mustn't change block/offset unless it's to a valid one
+             * otherwise we can go down some of the exit cases in the normal
+             * path.
+             */
+            block = tmpblock;
+            offset = tmpoffset;
         } else {
-            bytes_sent = ram_save_page(f, block, offset, last_stage);
-
-            /* if page is unmodified, continue to the next */
-            if (bytes_sent > 0) {
-                MigrationState *s = migrate_get_current();
-                if (s->sentmap) {
-                    set_bit(bitoffset, s->sentmap);
-                }
-
-                last_sent_block = block;
+            MemoryRegion *mr;
+            /* priority queue empty, so just search for something dirty */
+            mr = block->mr;
+            offset = migration_bitmap_find_and_reset_dirty(mr, offset,
+                                                           &bitoffset);
+            if (complete_round && block == last_seen_block &&
+                offset >= last_offset) {
                 break;
             }
+            if (offset >= block->length) {
+                offset = 0;
+                block = QTAILQ_NEXT(block, next);
+                if (!block) {
+                    block = QTAILQ_FIRST(&ram_list.blocks);
+                    complete_round = true;
+                    ram_bulk_stage = false;
+                }
+                continue; /* pick an offset in the new block */
+            }
+        }
+
+        /* We have a page to send, so send it */
+        bytes_sent = ram_save_page(f, block, offset, last_stage);
+
+        /* if page is unmodified, continue to the next */
+        if (bytes_sent > 0) {
+            if (ms->sentmap) {
+                set_bit(bitoffset, ms->sentmap);
+            }
+
+            last_sent_block = block;
+            break;
         }
     }
     last_seen_block = block;
