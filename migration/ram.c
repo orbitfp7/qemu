@@ -516,9 +516,9 @@ static int save_xbzrle_page(QEMUFile *f, uint8_t **current_data,
  * Returns: byte offset within memory region of the start of a dirty page
  */
 static inline
-ram_addr_t migration_bitmap_find_and_reset_dirty(RAMBlock *rb,
-                                                 ram_addr_t start,
-                                                 ram_addr_t *ram_addr_abs)
+ram_addr_t migration_bitmap_find_dirty(RAMBlock *rb,
+                                       ram_addr_t start,
+                                       ram_addr_t *ram_addr_abs)
 {
     unsigned long base = rb->offset >> TARGET_PAGE_BITS;
     unsigned long nr = base + (start >> TARGET_PAGE_BITS);
@@ -535,15 +535,24 @@ ram_addr_t migration_bitmap_find_and_reset_dirty(RAMBlock *rb,
         next = find_next_bit(bitmap, size, nr);
     }
 
-    if (next < size) {
-        clear_bit(next, bitmap);
-        migration_dirty_pages--;
-    }
     *ram_addr_abs = next << TARGET_PAGE_BITS;
     return (next - base) << TARGET_PAGE_BITS;
 }
 
-/* Called with rcu_read_lock() to protect migration_bitmap */
+static inline bool migration_bitmap_clear_dirty(ram_addr_t addr)
+{
+    bool ret;
+    int nr = addr >> TARGET_PAGE_BITS;
+    unsigned long *bitmap = atomic_rcu_read(&migration_bitmap);
+
+    ret = test_and_clear_bit(nr, bitmap);
+
+    if (ret) {
+        migration_dirty_pages--;
+    }
+    return ret;
+}
+
 static void migration_bitmap_sync_range(ram_addr_t start, ram_addr_t length)
 {
     unsigned long *bitmap;
@@ -960,9 +969,8 @@ static int ram_save_compressed_page(QEMUFile *f, RAMBlock *block,
 static bool find_dirty_block(QEMUFile *f, PageSearchStatus *pss,
                              bool *again, ram_addr_t *ram_addr_abs)
 {
-    pss->offset = migration_bitmap_find_and_reset_dirty(pss->block,
-                                                       pss->offset,
-                                                       ram_addr_abs);
+    pss->offset = migration_bitmap_find_dirty(pss->block, pss->offset,
+                                              ram_addr_abs);
     if (pss->complete_round && pss->block == last_seen_block &&
         pss->offset >= last_offset) {
         /*
@@ -999,6 +1007,88 @@ static bool find_dirty_block(QEMUFile *f, PageSearchStatus *pss,
         /* We've found something so probably don't need to */
         return true;
     }
+}
+
+/*
+ * Unqueue a page from the queue fed by postcopy page requests; skips pages
+ * that are already sent (!dirty)
+ *
+ * Returns:      true if a queued page is found
+ *      ms:      MigrationState in
+ *     pss:      PageSearchStatus structure updated with found block/offset
+ * ram_addr_abs: global offset in the dirty/sent bitmaps
+ */
+static bool get_queued_page(MigrationState *ms, PageSearchStatus *pss,
+                            ram_addr_t *ram_addr_abs)
+{
+    RAMBlock  *block;
+    ram_addr_t offset;
+    bool dirty;
+
+    do {
+        block = NULL;
+        qemu_mutex_lock(&ms->src_page_req_mutex);
+        if (!QSIMPLEQ_EMPTY(&ms->src_page_requests)) {
+            struct MigrationSrcPageRequest *entry =
+                                    QSIMPLEQ_FIRST(&ms->src_page_requests);
+            block = entry->rb;
+            offset = entry->offset;
+            *ram_addr_abs = (entry->offset + entry->rb->offset) &
+                            TARGET_PAGE_MASK;
+
+            if (entry->len > TARGET_PAGE_SIZE) {
+                entry->len -= TARGET_PAGE_SIZE;
+                entry->offset += TARGET_PAGE_SIZE;
+            } else {
+                memory_region_unref(block->mr);
+                QSIMPLEQ_REMOVE_HEAD(&ms->src_page_requests, next_req);
+                g_free(entry);
+            }
+        }
+        qemu_mutex_unlock(&ms->src_page_req_mutex);
+
+        /*
+         * We're sending this page, and since it's postcopy nothing else
+         * will dirty it, and we must make sure it doesn't get sent again
+         * even if this queue request was received after the background
+         * search already sent it.
+         */
+        if (block) {
+            dirty = test_bit(*ram_addr_abs >> TARGET_PAGE_BITS,
+                             migration_bitmap);
+            if (!dirty) {
+                trace_get_queued_page_not_dirty(
+                    block->idstr, (uint64_t)offset,
+                    (uint64_t)*ram_addr_abs,
+                    test_bit(*ram_addr_abs >> TARGET_PAGE_BITS, ms->sentmap));
+            } else {
+                trace_get_queued_page(block->idstr,
+                                      (uint64_t)offset,
+                                      (uint64_t)*ram_addr_abs);
+            }
+        }
+
+    } while (block && !dirty);
+
+    if (block) {
+        /*
+         * As soon as we start servicing pages out of order, then we have
+         * to kill the bulk stage, since the bulk stage assumes
+         * in (migration_bitmap_find_and_reset_dirty) that every page is
+         * dirty, that's no longer true.
+         */
+        ram_bulk_stage = false;
+
+        /*
+         * We want the background search to continue from the queued page
+         * since the guest is likely to want other pages near to the page
+         * it just requested.
+         */
+        pss->block = block;
+        pss->offset = offset;
+    }
+
+    return !!block;
 }
 
 /**
@@ -1087,6 +1177,57 @@ err:
 
 
 /**
+ * ram_save_host_page: Starting at *offset send pages upto the end
+ *                     of the current host page.  It's valid for the initial
+ *                     offset to point into the middle of a host page
+ *                     in which case the remainder of the hostpage is sent.
+ *                     Only dirty target pages are sent.
+ *
+ * Returns: Number of pages written.
+ *
+ * @f: QEMUFile where to send the data
+ * @block: pointer to block that contains the page we want to send
+ * @offset: offset inside the block for the page; updated to last target page
+ *          sent
+ * @last_stage: if we are at the completion stage
+ * @bytes_transferred: increase it with the number of transferred bytes
+ */
+static int ram_save_host_page(MigrationState *ms, QEMUFile *f, RAMBlock* block,
+                              ram_addr_t *offset, bool last_stage,
+                              uint64_t *bytes_transferred,
+                              ram_addr_t dirty_ram_abs)
+{
+    int tmppages, pages = 0;
+    do {
+        /* Check the pages is dirty and if it is send it */
+        if (migration_bitmap_clear_dirty(dirty_ram_abs)) {
+            if (compression_switch && migrate_use_compression()) {
+                tmppages = ram_save_compressed_page(f, block, *offset,
+                                                    last_stage,
+                                                    bytes_transferred);
+            } else {
+                tmppages = ram_save_page(f, block, *offset, last_stage,
+                                         bytes_transferred);
+            }
+
+            if (tmppages < 0) {
+                return tmppages;
+            }
+            if (ms->sentmap) {
+                set_bit(dirty_ram_abs >> TARGET_PAGE_BITS, ms->sentmap);
+            }
+            pages += tmppages;
+        }
+        *offset += TARGET_PAGE_SIZE;
+        dirty_ram_abs += TARGET_PAGE_SIZE;
+    } while (*offset & (qemu_host_page_size - 1));
+
+    /* The offset we leave with is the last one we looked at */
+    *offset -= TARGET_PAGE_SIZE;
+    return pages;
+}
+
+/**
  * ram_find_and_save_block: Finds a dirty page and sends it to f
  *
  * Called within an RCU critical section.
@@ -1097,12 +1238,16 @@ err:
  * @f: QEMUFile where to send the data
  * @last_stage: if we are at the completion stage
  * @bytes_transferred: increase it with the number of transferred bytes
+ *
+ * On systems where host-page-size > target-page-size it will send all the
+ * pages in a host page that are dirty.
  */
 
 static int ram_find_and_save_block(QEMUFile *f, bool last_stage,
                                    uint64_t *bytes_transferred)
 {
     PageSearchStatus pss;
+    MigrationState *ms = migrate_get_current();
     int pages = 0;
     bool again, found;
     ram_addr_t dirty_ram_abs; /* Address of the start of the dirty page in
@@ -1117,26 +1262,18 @@ static int ram_find_and_save_block(QEMUFile *f, bool last_stage,
     }
 
     do {
-        found = find_dirty_block(f, &pss, &again, &dirty_ram_abs);
+        again = true;
+        found = get_queued_page(ms, &pss, &dirty_ram_abs);
+
+        if (!found) {
+            /* priority queue empty, so just search for something dirty */
+            found = find_dirty_block(f, &pss, &again, &dirty_ram_abs);
+        }
 
         if (found) {
-            if (compression_switch && migrate_use_compression()) {
-                pages = ram_save_compressed_page(f, pss.block, pss.offset,
-                                                 last_stage,
-                                                 bytes_transferred);
-            } else {
-                pages = ram_save_page(f, pss.block, pss.offset, last_stage,
-                                      bytes_transferred);
-            }
-
-            /* if page is unmodified, continue to the next */
-            if (pages > 0) {
-                MigrationState *ms = migrate_get_current();
-                last_sent_block = pss.block;
-                if (ms->sentmap) {
-                    set_bit(dirty_ram_abs >> TARGET_PAGE_BITS, ms->sentmap);
-                }
-            }
+            pages = ram_save_host_page(ms, f, pss.block, &pss.offset,
+                                       last_stage, bytes_transferred,
+                                       dirty_ram_abs);
         }
     } while (!pages && again);
 
