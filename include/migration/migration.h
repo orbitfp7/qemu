@@ -45,6 +45,7 @@ enum mig_rpcomm_cmd {
     MIG_RPCOMM_INVALID = 0,  /* Must be 0 */
     MIG_RPCOMM_SHUT,         /* sibling will not send any more RP messages */
     MIG_RPCOMM_ACK,          /* data (seq: be32 ) */
+    MIG_RPCOMM_REQPAGES,     /* data (start: be64, len: be64) */
     MIG_RPCOMM_AFTERLASTVALID
 };
 
@@ -240,6 +241,8 @@ void migrate_send_rp_shut(MigrationIncomingState *mis,
                           uint32_t value);
 void migrate_send_rp_ack(MigrationIncomingState *mis,
                          uint32_t value);
+void migrate_send_rp_reqpages(MigrationIncomingState *mis, const char* rbname,
+                              ram_addr_t start, ram_addr_t len);
 
 
 void ram_control_before_iterate(QEMUFile *f, uint64_t flags);
