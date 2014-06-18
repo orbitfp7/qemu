@@ -46,6 +46,8 @@ enum mig_rpcomm_cmd {
     MIG_RP_CMD_INVALID = 0,  /* Must be 0 */
     MIG_RP_CMD_SHUT,         /* sibling will not send any more RP messages */
     MIG_RP_CMD_PONG,         /* Response to a PING; data (seq: be32 ) */
+
+    MIG_RP_CMD_REQ_PAGES,    /* data (start: be64, len: be64) */
 };
 
 /* Postcopy page-map-incoming - data about each page on the inbound side */
@@ -253,6 +255,8 @@ void migrate_send_rp_shut(MigrationIncomingState *mis,
                           uint32_t value);
 void migrate_send_rp_pong(MigrationIncomingState *mis,
                           uint32_t value);
+void migrate_send_rp_req_pages(MigrationIncomingState *mis, const char* rbname,
+                              ram_addr_t start, ram_addr_t len);
 
 void ram_control_before_iterate(QEMUFile *f, uint64_t flags);
 void ram_control_after_iterate(QEMUFile *f, uint64_t flags);
