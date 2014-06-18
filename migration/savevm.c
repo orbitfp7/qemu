@@ -37,6 +37,7 @@
 #include "qemu/timer.h"
 #include "audio/audio.h"
 #include "migration/migration.h"
+#include "migration/postcopy-ram.h"
 #include "qemu/sockets.h"
 #include "qemu/queue.h"
 #include "sysemu/cpus.h"
@@ -1162,6 +1163,10 @@ static int loadvm_postcopy_handle_advise(MigrationIncomingState *mis,
     trace_loadvm_postcopy_handle_advise();
     if (ps != POSTCOPY_INCOMING_NONE) {
         error_report("CMD_POSTCOPY_ADVISE in wrong postcopy state (%d)", ps);
+        return -1;
+    }
+
+    if (!postcopy_ram_supported_by_host()) {
         return -1;
     }
 
