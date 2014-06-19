@@ -995,3 +995,16 @@ void migrate_fd_connect(MigrationState *s)
     qemu_thread_create(&s->thread, "migration", migration_thread, s,
                        QEMU_THREAD_JOINABLE);
 }
+
+PostcopyState  postcopy_state_get(MigrationIncomingState *mis)
+{
+    return atomic_fetch_add(&mis->postcopy_state, 0);
+}
+
+/* Set the state and return the old state */
+PostcopyState postcopy_state_set(MigrationIncomingState *mis,
+                                 PostcopyState new_state)
+{
+    return atomic_xchg(&mis->postcopy_state, new_state);
+}
+

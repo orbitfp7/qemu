@@ -52,12 +52,22 @@ typedef struct MigrationState MigrationState;
 
 typedef QLIST_HEAD(, LoadStateEntry) LoadStateEntry_Head;
 
+typedef enum {
+    POSTCOPY_INCOMING_NONE = 0,  /* Initial state - no postcopy */
+    POSTCOPY_INCOMING_ADVISE,
+    POSTCOPY_INCOMING_LISTENING,
+    POSTCOPY_INCOMING_RUNNING,
+    POSTCOPY_INCOMING_END
+} PostcopyState;
+
 /* State for the incoming migration */
 struct MigrationIncomingState {
     QEMUFile *file;
 
     /* See savevm.c */
     LoadStateEntry_Head loadvm_handlers;
+
+    PostcopyState postcopy_state;
 
     /*
      * Free at the start of the main state load, set as the main thread finishes
@@ -220,4 +230,9 @@ size_t ram_control_save_page(QEMUFile *f, ram_addr_t block_offset,
                              ram_addr_t offset, size_t size,
                              uint64_t *bytes_sent);
 
+PostcopyState postcopy_state_get(MigrationIncomingState *mis);
+
+/* Set the state and return the old state */
+PostcopyState postcopy_state_set(MigrationIncomingState *mis,
+                                 PostcopyState new_state);
 #endif
