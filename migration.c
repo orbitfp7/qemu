@@ -205,11 +205,32 @@ static void process_incoming_migration_co(void *opaque)
 {
     QEMUFile *f = opaque;
     Error *local_err = NULL;
+    MigrationIncomingState *mis;
     int ret;
 
-    migration_incoming_state_init(f);
+    mis = migration_incoming_state_init(f);
 
     ret = qemu_loadvm_state(f);
+
+    DPRINTF("%s: ret=%d postcopy_ram_state=%d", __func__, ret,
+            mis->postcopy_ram_state);
+    if (mis->postcopy_ram_state == POSTCOPY_RAM_INCOMING_ADVISE) {
+        /*
+         * Where a migration had postcopy enabled (and thus went to advise)
+         * but managed to complete within the precopy period
+         */
+        postcopy_ram_incoming_cleanup(mis);
+    } else {
+        if ((ret >= 0) &&
+            (mis->postcopy_ram_state > POSTCOPY_RAM_INCOMING_ADVISE)) {
+            /*
+             * Postcopy was started, cleanup should happen at the end of the
+             * postcopy thread.
+             */
+            DPRINTF("process_incoming_migration_co: exiting main branch");
+            return;
+        }
+    }
 
     qemu_fclose(f);
     free_xbzrle_decoded_buf();
