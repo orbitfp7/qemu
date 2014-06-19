@@ -1145,13 +1145,10 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
             total_ram_bytes = addr;
             while (!ret && total_ram_bytes) {
                 RAMBlock *block;
-                uint8_t len;
                 char id[256];
                 ram_addr_t length;
 
-                len = qemu_get_byte(f);
-                qemu_get_buffer(f, (uint8_t *)id, len);
-                id[len] = 0;
+                qemu_get_counted_string(f, id);
                 length = qemu_get_be64(f);
 
                 QLIST_FOREACH_RCU(block, &ram_list.blocks, next) {
