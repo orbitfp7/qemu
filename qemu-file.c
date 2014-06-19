@@ -879,6 +879,21 @@ uint64_t qemu_get_be64(QEMUFile *f)
     return v;
 }
 
+/*
+ * Get a string whose length is determined by a single preceding byte
+ * A preallocated 256 byte buffer must be passed in.
+ * Returns: 0 on success and a 0 terminated string in the buffer
+ */
+int qemu_get_counted_string(QEMUFile *f, uint8_t *buf)
+{
+    unsigned int len = qemu_get_byte(f);
+    int res = qemu_get_buffer(f, buf, len);
+
+    buf[len] = 0;
+
+    return res != len;
+}
+
 #define QSB_CHUNK_SIZE      (1 << 10)
 #define QSB_MAX_CHUNK_SIZE  (16 * QSB_CHUNK_SIZE)
 
