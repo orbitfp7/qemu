@@ -50,6 +50,15 @@ enum mig_rp_message_type {
 };
 
 typedef QLIST_HEAD(, LoadStateEntry) LoadStateEntry_Head;
+
+typedef enum {
+    POSTCOPY_INCOMING_NONE = 0,  /* Initial state - no postcopy */
+    POSTCOPY_INCOMING_ADVISE,
+    POSTCOPY_INCOMING_LISTENING,
+    POSTCOPY_INCOMING_RUNNING,
+    POSTCOPY_INCOMING_END
+} PostcopyState;
+
 /* State for the incoming migration */
 struct MigrationIncomingState {
     QEMUFile *file;
@@ -62,6 +71,7 @@ struct MigrationIncomingState {
 
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
+    PostcopyState postcopy_state;
 
     /* See savevm.c */
     LoadStateEntry_Head loadvm_handlers;
@@ -231,4 +241,10 @@ size_t ram_control_save_page(QEMUFile *f, ram_addr_t block_offset,
 
 void ram_mig_init(void);
 void savevm_skip_section_footers(void);
+
+PostcopyState postcopy_state_get(MigrationIncomingState *mis);
+
+/* Set the state and return the old state */
+PostcopyState postcopy_state_set(MigrationIncomingState *mis,
+                                 PostcopyState new_state);
 #endif
