@@ -87,6 +87,18 @@ enum qemu_vm_cmd {
     MIG_CMD_INVALID = 0,       /* Must be 0 */
     MIG_CMD_OPEN_RETURN_PATH,  /* Tell the dest to open the Return path */
     MIG_CMD_PING,              /* Request a PONG on the RP */
+
+    MIG_CMD_POSTCOPY_ADVISE = 20,  /* Prior to any page transfers, just
+                                      warn we might want to do PC */
+    MIG_CMD_POSTCOPY_LISTEN,       /* Start listening for incoming
+                                      pages as it's running. */
+    MIG_CMD_POSTCOPY_RUN,          /* Start execution */
+    MIG_CMD_POSTCOPY_END,          /* Postcopy is finished. */
+
+    MIG_CMD_POSTCOPY_RAM_DISCARD,  /* A list of pages to discard that
+                                      were previously sent during
+                                      precopy but are dirty. */
+
 };
 
 bool qemu_savevm_state_blocked(Error **errp);
@@ -101,6 +113,17 @@ void qemu_savevm_command_send(QEMUFile *f, enum qemu_vm_cmd command,
                               uint16_t len, uint8_t *data);
 void qemu_savevm_send_ping(QEMUFile *f, uint32_t value);
 void qemu_savevm_send_open_return_path(QEMUFile *f);
+void qemu_savevm_send_postcopy_advise(QEMUFile *f);
+void qemu_savevm_send_postcopy_listen(QEMUFile *f);
+void qemu_savevm_send_postcopy_run(QEMUFile *f);
+void qemu_savevm_send_postcopy_end(QEMUFile *f, uint8_t status);
+
+void qemu_savevm_send_postcopy_ram_discard(QEMUFile *f, const char *name,
+                                           uint16_t len, uint8_t offset,
+                                           uint64_t *addrlist,
+                                           uint32_t *masklist);
+
+
 int qemu_loadvm_state(QEMUFile *f);
 
 /* SLIRP */
