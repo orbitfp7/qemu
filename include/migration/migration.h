@@ -61,6 +61,14 @@ typedef struct MigrationState MigrationState;
 struct MigrationIncomingState {
     QEMUFile *file;
 
+    volatile enum {
+        POSTCOPY_RAM_INCOMING_NONE = 0,  /* Initial state - no postcopy */
+        POSTCOPY_RAM_INCOMING_ADVISE,
+        POSTCOPY_RAM_INCOMING_LISTENING,
+        POSTCOPY_RAM_INCOMING_RUNNING,
+        POSTCOPY_RAM_INCOMING_END
+    } postcopy_ram_state;
+
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
 };

@@ -88,6 +88,16 @@ enum qemu_vm_cmd {
     QEMU_VM_CMD_OPENRP,        /* Tell the dest to open the Return path */
     QEMU_VM_CMD_REQACK,        /* Request an ACK on the RP */
 
+    QEMU_VM_CMD_POSTCOPY_RAM_ADVISE = 20,  /* Prior to any page transfers, just
+                                              warn we might want to do PC */
+    QEMU_VM_CMD_POSTCOPY_RAM_DISCARD,      /* A list of pages to discard that
+                                              were previously sent during
+                                              precopy but are dirty. */
+    QEMU_VM_CMD_POSTCOPY_RAM_LISTEN,       /* Start listening for incoming
+                                              pages as it's running. */
+    QEMU_VM_CMD_POSTCOPY_RAM_RUN,          /* Start execution */
+    QEMU_VM_CMD_POSTCOPY_RAM_END,          /* Postcopy is finished. */
+
     QEMU_VM_CMD_AFTERLASTVALID
 };
 
@@ -102,6 +112,16 @@ void qemu_savevm_command_send(QEMUFile *f, enum qemu_vm_cmd command,
                               uint16_t len, uint8_t *data);
 void qemu_savevm_send_reqack(QEMUFile *f, uint32_t value);
 void qemu_savevm_send_openrp(QEMUFile *f);
+void qemu_savevm_send_postcopy_ram_advise(QEMUFile *f);
+void qemu_savevm_send_postcopy_ram_discard(QEMUFile *f, const char *name,
+                                           uint16_t len, uint8_t offset,
+                                           uint64_t *addrlist,
+                                           uint32_t *masklist);
+
+void qemu_savevm_send_postcopy_ram_listen(QEMUFile *f);
+void qemu_savevm_send_postcopy_ram_run(QEMUFile *f);
+void qemu_savevm_send_postcopy_ram_end(QEMUFile *f, uint8_t status);
+
 int qemu_loadvm_state(QEMUFile *f);
 
 /* SLIRP */
