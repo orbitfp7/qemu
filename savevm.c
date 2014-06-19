@@ -908,7 +908,7 @@ int qemu_loadvm_state(QEMUFile *f)
 
     v = qemu_get_be32(f);
     if (v == QEMU_VM_FILE_VERSION_COMPAT) {
-        fprintf(stderr, "SaveVM v2 format is obsolete and don't work anymore\n");
+        error_report("SaveVM v2 format is obsolete and don't work anymore");
         return -ENOTSUP;
     }
     if (v != QEMU_VM_FILE_VERSION) {
@@ -918,31 +918,33 @@ int qemu_loadvm_state(QEMUFile *f)
     while ((section_type = qemu_get_byte(f)) != QEMU_VM_EOF) {
         uint32_t instance_id, version_id, section_id;
         SaveStateEntry *se;
-        char idstr[257];
-        int len;
+        char idstr[256];
 
         switch (section_type) {
         case QEMU_VM_SECTION_START:
         case QEMU_VM_SECTION_FULL:
             /* Read section start */
             section_id = qemu_get_be32(f);
-            len = qemu_get_byte(f);
-            qemu_get_buffer(f, (uint8_t *)idstr, len);
-            idstr[len] = 0;
+            if (qemu_get_counted_string(f, (uint8_t *)idstr)) {
+                error_report("Unable to read ID string for section %u",
+                            section_id);
+                return -EINVAL;
+            }
             instance_id = qemu_get_be32(f);
             version_id = qemu_get_be32(f);
 
             /* Find savevm section */
             se = find_se(idstr, instance_id);
             if (se == NULL) {
-                fprintf(stderr, "Unknown savevm section or instance '%s' %d\n", idstr, instance_id);
+                error_report("Unknown savevm section or instance '%s' %d",
+                             idstr, instance_id);
                 ret = -EINVAL;
                 goto out;
             }
 
             /* Validate version */
             if (version_id > se->version_id) {
-                fprintf(stderr, "savevm: unsupported version %d for '%s' v%d\n",
+                error_report("savevm: unsupported version %d for '%s' v%d",
                         version_id, idstr, se->version_id);
                 ret = -EINVAL;
                 goto out;
