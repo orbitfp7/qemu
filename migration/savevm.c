@@ -1279,6 +1279,12 @@ static int loadvm_postcopy_handle_advise(MigrationIncomingState *mis,
         return -1;
     }
 
+    if (ram_postcopy_incoming_init(mis)) {
+        return -1;
+    }
+
+    postcopy_state_set(POSTCOPY_INCOMING_ADVISE);
+
     return 0;
 }
 
