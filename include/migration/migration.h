@@ -172,6 +172,11 @@ double xbzrle_mig_cache_miss_rate(void);
 
 void ram_handle_compressed(void *host, uint8_t ch, uint64_t size);
 void ram_debug_dump_bitmap(unsigned long *todump, bool expected);
+int64_t ram_mask_postcopy_bitmap(MigrationState *ms);
+int ram_postcopy_each_ram_discard(MigrationState *ms);
+int ram_discard_range(MigrationIncomingState *mis, const char *block_name,
+                      int source_target_page_bits,
+                      uint64_t start, uint64_t end);
 
 /**
  * @migrate_add_blocker - prevent migration from proceeding

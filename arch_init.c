@@ -40,6 +40,7 @@
 #include "hw/audio/audio.h"
 #include "sysemu/kvm.h"
 #include "migration/migration.h"
+#include "migration/postcopy-ram.h"
 #include "hw/i386/smbios.h"
 #include "exec/address-spaces.h"
 #include "hw/audio/pcspk.h"
@@ -413,9 +414,15 @@ static int save_xbzrle_page(QEMUFile *f, uint8_t **current_data,
     return bytes_sent;
 }
 
+/* mr: The region to search for dirty pages in
+ * start: Start address (typically so we can continue from previous page)
+ * bitoffset: Pointer into which to store the offset into the dirty map
+ *            at which the bit was found.
+ */
 static inline
 ram_addr_t migration_bitmap_find_and_reset_dirty(MemoryRegion *mr,
-                                                 ram_addr_t start)
+                                                 ram_addr_t start,
+                                                 unsigned long *bitoffset)
 {
     unsigned long base = mr->ram_addr >> TARGET_PAGE_BITS;
     unsigned long nr = base + (start >> TARGET_PAGE_BITS);
@@ -434,6 +441,7 @@ ram_addr_t migration_bitmap_find_and_reset_dirty(MemoryRegion *mr,
         clear_bit(next, migration_bitmap);
         migration_dirty_pages--;
     }
+    *bitoffset = next;
     return (next - base) << TARGET_PAGE_BITS;
 }
 
@@ -562,6 +570,19 @@ static void migration_bitmap_sync(void)
     }
 }
 
+static RAMBlock *ram_find_block(const char *id)
+{
+    RAMBlock *block;
+
+    QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+        if (!strcmp(id, block->idstr)) {
+            return block;
+        }
+    }
+
+    return NULL;
+}
+
 /*
  * ram_save_page: Send the given page to the stream
  *
@@ -650,13 +671,14 @@ static int ram_find_and_save_block(QEMUFile *f, bool last_stage)
     bool complete_round = false;
     int bytes_sent = 0;
     MemoryRegion *mr;
+    unsigned long bitoffset;
 
     if (!block)
         block = QTAILQ_FIRST(&ram_list.blocks);
 
     while (true) {
         mr = block->mr;
-        offset = migration_bitmap_find_and_reset_dirty(mr, offset);
+        offset = migration_bitmap_find_and_reset_dirty(mr, offset, &bitoffset);
         if (complete_round && block == last_seen_block &&
             offset >= last_offset) {
             break;
@@ -674,6 +696,11 @@ static int ram_find_and_save_block(QEMUFile *f, bool last_stage)
 
             /* if page is unmodified, continue to the next */
             if (bytes_sent > 0) {
+                MigrationState *s = migrate_get_current();
+                if (s->sentmap) {
+                    set_bit(bitoffset, s->sentmap);
+                }
+
                 last_sent_block = block;
                 break;
             }
@@ -733,10 +760,17 @@ void free_xbzrle_decoded_buf(void)
 
 static void migration_end(void)
 {
+    MigrationState *s = migrate_get_current();
+
     if (migration_bitmap) {
         memory_global_dirty_log_stop();
         g_free(migration_bitmap);
         migration_bitmap = NULL;
+    }
+
+    if (s->sentmap) {
+        g_free(s->sentmap);
+        s->sentmap = NULL;
     }
 
     XBZRLE_cache_lock();
@@ -806,6 +840,123 @@ void ram_debug_dump_bitmap(unsigned long *todump, bool expected)
     }
 }
 
+/*
+ * Utility for the outgoing postcopy code; this performs
+ * sentmap &= migration_bitmap
+ * returning the length of the bitmap
+ */
+int64_t ram_mask_postcopy_bitmap(MigrationState *ms)
+{
+    int64_t ram_pages = last_ram_offset() >> TARGET_PAGE_BITS;
+
+    migration_bitmap_sync();
+    bitmap_and(ms->sentmap, ms->sentmap, migration_bitmap, ram_pages);
+    return ram_pages;
+}
+
+/*
+ * Utility for the outgoing postcopy code.
+ *   Calls postcopy_send_discard_bm_ram for each RAMBlock
+ *   passing it bitmap indexes and name.
+ * Returns: 0 on success
+ * (qemu_ram_foreach_block ends up passing unscaled lengths
+ *  which would mean postcopy code would have to deal with target page)
+ */
+int ram_postcopy_each_ram_discard(MigrationState *ms)
+{
+    struct RAMBlock *block;
+    int ret;
+
+    QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+        /*
+         * Postcopy sends chunks of bitmap over the wire, but it
+         * just needs indexes at this point, avoids it having
+         * target page specific code.
+         */
+        unsigned long first, last;
+        first = block->offset >> TARGET_PAGE_BITS;
+        last = (block->offset + (block->length-1)) >> TARGET_PAGE_BITS;
+        ret = postcopy_send_discard_bm_ram(ms, block->idstr, first, last);
+        if (ret) {
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * At the start of the postcopy phase of migration, any now-dirty
+ * precopied pages are discarded.
+ *
+ * start..end is an inclusive range of bits indexed in the source
+ *    VMs bitmap for this RAMBlock, source_target_page_bits tells
+ *    us what one of those bits represents.
+ *
+ * start/end are offsets from the start of the bitmap for RAMBlock 'block_name'
+ *
+ * Returns 0 on success.
+ */
+int ram_discard_range(MigrationIncomingState *mis,
+                      const char *block_name,
+                      int source_target_page_bits,
+                      uint64_t start, uint64_t end)
+{
+    assert(end >= start);
+    unsigned int bitdif;
+
+    RAMBlock *rb = ram_find_block(block_name);
+
+    if (!rb) {
+        error_report("ram_discard_range: Failed to find block '%s'",
+                     block_name);
+        return -1;
+    }
+
+    if (source_target_page_bits != TARGET_PAGE_BITS) {
+        if (source_target_page_bits < TARGET_PAGE_BITS) {
+            /*
+             * e.g. source is 4K and we're 64k - we'll have to discard
+             * on the larger boundary
+             * e.g. a range of  70K...132K we would discard from
+             * 64K..192K, so round start down, and end up
+             */
+            bitdif = TARGET_PAGE_BITS - source_target_page_bits;
+            start = start >> bitdif;
+            if (end & ((1<<bitdif)-1)) {
+                end = end >> bitdif;
+                end++;
+            } else {
+                end = end >> bitdif;
+            }
+
+        } else {
+            /* e.g. source is 64K and we're 4K - easy just scale the indexes */
+            bitdif = source_target_page_bits - TARGET_PAGE_BITS;
+
+            start = start << bitdif;
+            end = end << bitdif;
+        }
+    }
+
+    uint64_t index_offset = rb->offset >> TARGET_PAGE_BITS;
+    postcopy_pmi_discard_range(mis, start + index_offset, (end - start) + 1);
+
+    /* +1 gives the byte after the end of the last page to be discarded */
+    ram_addr_t end_offset = (end+1) << TARGET_PAGE_BITS;
+    uint8_t *host_startaddr = rb->host + (start << TARGET_PAGE_BITS);
+    uint8_t *host_endaddr;
+
+    if (end_offset <= rb->length) {
+        host_endaddr   = rb->host + (end_offset-1);
+        return postcopy_ram_discard_range(mis, host_startaddr, host_endaddr);
+    } else {
+        error_report("ram_discard_range: Overrun block '%s' (%zu/%zu/%zu)",
+                     block_name, start, end, rb->length);
+        return -1;
+    }
+}
+
 static int ram_save_setup(QEMUFile *f, void *opaque)
 {
     RAMBlock *block;
@@ -844,7 +995,6 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
 
         acct_clear();
     }
-
     qemu_mutex_lock_iothread();
     qemu_mutex_lock_ramlist();
     bytes_transferred = 0;
@@ -853,6 +1003,12 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
     ram_bitmap_pages = last_ram_offset() >> TARGET_PAGE_BITS;
     migration_bitmap = bitmap_new(ram_bitmap_pages);
     bitmap_set(migration_bitmap, 0, ram_bitmap_pages);
+
+    if (migrate_postcopy_ram()) {
+        MigrationState *s = migrate_get_current();
+        s->sentmap = bitmap_new(ram_bitmap_pages);
+        bitmap_clear(s->sentmap, 0, ram_bitmap_pages);
+    }
 
     /*
      * Count the total number of pages used by ram blocks not including any

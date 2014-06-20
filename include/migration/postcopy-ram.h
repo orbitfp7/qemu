@@ -13,7 +13,27 @@
 #ifndef QEMU_POSTCOPY_RAM_H
 #define QEMU_POSTCOPY_RAM_H
 
+#include "migration/migration.h"
+
 /* Return 0 if the host supports everything we need to do postcopy-ram */
 int postcopy_ram_hosttest(void);
+
+/* Send the list of sent-but-dirty pages */
+int postcopy_send_discard_bitmap(MigrationState *ms);
+
+/*
+ * Discard the contents of memory start..end inclusive.
+ * We can assume that if we've been called postcopy_ram_hosttest returned true
+ */
+int postcopy_ram_discard_range(MigrationIncomingState *mis, uint8_t *start,
+                               uint8_t *end);
+
+
+/*
+ * Called back from arch_init's ram_postcopy_each_ram_discard to handle
+ * discarding one RAMBlock's pre-postcopy dirty pages
+ */
+int postcopy_send_discard_bm_ram(MigrationState *ms, const char *name,
+                                 unsigned long start, unsigned long end);
 
 #endif
