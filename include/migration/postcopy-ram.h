@@ -36,4 +36,14 @@ int postcopy_ram_discard_range(MigrationIncomingState *mis, uint8_t *start,
 int postcopy_send_discard_bm_ram(MigrationState *ms, const char *name,
                                  unsigned long start, unsigned long end);
 
+/*
+ * In 'advise' mode record that a page has been received.
+ */
+void postcopy_hook_early_receive(MigrationIncomingState *mis,
+                                 size_t bitmap_index);
+
+void postcopy_pmi_destroy(MigrationIncomingState *mis);
+void postcopy_pmi_discard_range(MigrationIncomingState *mis,
+                                size_t start, size_t npages);
+void postcopy_pmi_dump(MigrationIncomingState *mis);
 #endif
