@@ -424,6 +424,8 @@
 #
 # @active: in the process of doing migration.
 #
+# @postcopy-active: like active, but now in postcopy mode. (since 2.4)
+#
 # @completed: migration is finished.
 #
 # @failed: some error occurred during migration process.
@@ -433,7 +435,7 @@
 ##
 { 'enum': 'MigrationStatus',
   'data': [ 'none', 'setup', 'cancelling', 'cancelled',
-            'active', 'completed', 'failed' ] }
+            'active', 'postcopy-active', 'completed', 'failed' ] }
 
 ##
 # @MigrationInfo
