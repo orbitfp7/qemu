@@ -195,6 +195,7 @@ int ram_postcopy_each_ram_discard(MigrationState *ms);
 int ram_discard_range(MigrationIncomingState *mis, const char *block_name,
                       int source_target_page_bits,
                       uint64_t start, uint64_t end);
+int ram_postcopy_incoming_init(MigrationIncomingState *mis);
 
 /**
  * @migrate_add_blocker - prevent migration from proceeding
