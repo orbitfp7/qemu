@@ -153,6 +153,8 @@ MigrationState *migrate_init(const MigrationParams *params);
 bool migration_in_setup(MigrationState *);
 bool migration_has_finished(MigrationState *);
 bool migration_has_failed(MigrationState *);
+/* True if outgoing migration has entered postcopy phase */
+bool migration_postcopy_phase(MigrationState *);
 MigrationState *migrate_get_current(void);
 
 uint64_t ram_bytes_remaining(void);
