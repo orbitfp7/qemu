@@ -991,16 +991,36 @@ static int postcopy_start(MigrationState *ms)
 static void *migration_thread(void *opaque)
 {
     MigrationState *s = opaque;
+    /* Used by the bandwidth calcs, updated later */
     int64_t initial_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     int64_t setup_start = qemu_clock_get_ms(QEMU_CLOCK_HOST);
     int64_t initial_bytes = 0;
     int64_t max_size = 0;
     int64_t start_time = initial_time;
+
     bool old_vm_running = false;
+
+    /* The active state we expect to be in; ACTIVE or POSTCOPY_ACTIVE */
+    enum MigrationPhase current_active_type = MIG_STATE_ACTIVE;
 
     qemu_savevm_state_begin(s->file, &s->params);
 
+    if (migrate_postcopy_ram()) {
+        /* Now tell the dest that it should open it's end so it can reply */
+        qemu_savevm_send_openrp(s->file);
+
+        /* And ask it to send an ack that will make stuff easier to debug */
+        qemu_savevm_send_reqack(s->file, 1);
+
+        /* Tell the destination that we *might* want to do postcopy later;
+         * if the other end can't do postcopy it should fail now, nice and
+         * early.
+         */
+        qemu_savevm_send_postcopy_ram_advise(s->file);
+    }
+
     s->setup_time = qemu_clock_get_ms(QEMU_CLOCK_HOST) - setup_start;
+    current_active_type = MIG_STATE_ACTIVE;
     migrate_set_state(s, MIG_STATE_SETUP, MIG_STATE_ACTIVE);
 
     DPRINTF("setup complete\n");
@@ -1021,37 +1041,74 @@ static void *migration_thread(void *opaque)
                     " nonpost=%" PRIu64 ")\n",
                     pending_size, max_size, pend_post, pend_nonpost);
             if (pending_size && pending_size >= max_size) {
+                /* Still a significant amount to transfer */
+
+                current_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+                if (migrate_postcopy_ram() &&
+                    s->state != MIG_STATE_POSTCOPY_ACTIVE &&
+                    pend_nonpost == 0 && s->start_postcopy) {
+
+                    if (!postcopy_start(s)) {
+                        current_active_type = MIG_STATE_POSTCOPY_ACTIVE;
+                    }
+
+                    continue;
+                }
+                /* Just another iteration step */
                 qemu_savevm_state_iterate(s->file);
             } else {
                 int ret;
 
-                DPRINTF("done iterating\n");
-                qemu_mutex_lock_iothread();
-                start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-                qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
-                old_vm_running = runstate_is_running();
+                DPRINTF("done iterating pending size %" PRIu64 "\n",
+                        pending_size);
 
-                ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
-                if (ret >= 0) {
-                    qemu_file_set_rate_limit(s->file, INT64_MAX);
-                    qemu_savevm_state_complete(s->file);
+                if (s->state == MIG_STATE_ACTIVE) {
+                    qemu_mutex_lock_iothread();
+                    start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+                    qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
+                    old_vm_running = runstate_is_running();
+
+                    ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
+                    if (ret >= 0) {
+                        qemu_file_set_rate_limit(s->file, INT64_MAX);
+                        qemu_savevm_state_complete(s->file);
+                    }
+                    qemu_mutex_unlock_iothread();
+
+                    if (ret < 0) {
+                        migrate_set_state(s, current_active_type,
+                                          MIG_STATE_ERROR);
+                        break;
+                    }
+                } else if (s->state == MIG_STATE_POSTCOPY_ACTIVE) {
+                    DPRINTF("postcopy end\n");
+
+                    qemu_savevm_state_postcopy_complete(s->file);
+                    DPRINTF("postcopy end after complete\n");
+
                 }
-                qemu_mutex_unlock_iothread();
 
-                if (ret < 0) {
-                    migrate_set_state(s, MIG_STATE_ACTIVE, MIG_STATE_ERROR);
-                    break;
+                /*
+                 * If rp was opened we must clean up the thread before
+                 * cleaning everything else up.
+                 * Postcopy opens rp if enabled (even if it's not avtivated)
+                 */
+                if (migrate_postcopy_ram()) {
+                    DPRINTF("before rp close");
+                    await_outgoing_return_path_close(s);
+                    DPRINTF("after rp close");
                 }
-
                 if (!qemu_file_get_error(s->file)) {
-                    migrate_set_state(s, MIG_STATE_ACTIVE, MIG_STATE_COMPLETED);
+                    migrate_set_state(s, current_active_type,
+                                      MIG_STATE_COMPLETED);
                     break;
                 }
             }
         }
 
         if (qemu_file_get_error(s->file)) {
-            migrate_set_state(s, MIG_STATE_ACTIVE, MIG_STATE_ERROR);
+            migrate_set_state(s, current_active_type, MIG_STATE_ERROR);
+            DPRINTF("migration_thread: file is in error state\n");
             break;
         }
         current_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -1082,6 +1139,7 @@ static void *migration_thread(void *opaque)
         }
     }
 
+    DPRINTF("migration_thread: After loop");
     qemu_mutex_lock_iothread();
     if (s->state == MIG_STATE_COMPLETED) {
         int64_t end_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
