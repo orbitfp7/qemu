@@ -203,6 +203,7 @@ int ram_postcopy_send_discard_bitmap(MigrationState *ms);
 /* For incoming postcopy discard */
 int ram_discard_range(MigrationIncomingState *mis, const char *block_name,
                       uint64_t start, uint64_t end);
+int ram_postcopy_incoming_init(MigrationIncomingState *mis);
 
 /**
  * @migrate_add_blocker - prevent migration from proceeding
