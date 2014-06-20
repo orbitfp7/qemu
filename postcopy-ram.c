@@ -229,7 +229,6 @@ static PostcopyPMIState postcopy_pmi_get_state_nolock(
 }
 
 /* Retrieve the state of the given page */
-__attribute__ (( unused )) /* Until later in patch series */
 static PostcopyPMIState postcopy_pmi_get_state(MigrationIncomingState *mis,
                                                size_t bitmap_index)
 {
@@ -245,7 +244,6 @@ static PostcopyPMIState postcopy_pmi_get_state(MigrationIncomingState *mis,
  * Set the page state to the given state if the previous state was as expected
  * Return the actual previous state.
  */
-__attribute__ (( unused )) /* Until later in patch series */
 static PostcopyPMIState postcopy_pmi_change_state(MigrationIncomingState *mis,
                                            size_t bitmap_index,
                                            PostcopyPMIState expected_state,
@@ -464,6 +462,7 @@ static int cleanup_area(const char *block_name, void *host_addr,
 int postcopy_ram_incoming_init(MigrationIncomingState *mis, size_t ram_pages)
 {
     postcopy_pmi_init(mis, ram_pages);
+    mis->postcopy_place_skipped = -1;
 
     if (qemu_ram_foreach_block(init_area, mis)) {
         return -1;
@@ -482,6 +481,10 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
         return -1;
     }
 
+    if (mis->postcopy_tmp_page) {
+        munmap(mis->postcopy_tmp_page, getpagesize());
+        mis->postcopy_tmp_page = NULL;
+    }
     return 0;
 }
 
@@ -551,6 +554,126 @@ int postcopy_ram_enable_notify(MigrationIncomingState *mis)
     return 0;
 }
 
+/*
+ * Place a zero'd page of memory at *host
+ * returns 0 on success
+ * bitmap_offset: Index into the migration bitmaps
+ */
+int postcopy_place_zero_page(MigrationIncomingState *mis, void *host,
+                             long bitmap_offset)
+{
+    void *tmp = postcopy_get_tmp_page(mis, bitmap_offset);
+    if (!tmp) {
+        return -ENOMEM;
+    }
+    *(char *)tmp = 0;
+    return postcopy_place_page(mis, host, tmp, bitmap_offset);
+}
+
+/*
+ * Place a target page (from) at (host) efficiently
+ *    There are restrictions on how 'from' must be mapped, in general best
+ *    to use other postcopy_ routines to allocate.
+ * returns 0 on success
+ * bitmap_offset: Index into the migration bitmaps
+ *
+ * Where HPS > TPS it holds off doing the place until the last TP in the HP
+ *  and assumes (from, host) point to the last TP in a continuous HP
+ */
+int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
+                        long bitmap_offset)
+{
+    PostcopyPMIState old_state, tmp_state;
+    size_t hps = sysconf(_SC_PAGESIZE);
+
+    /* Only place the page when the last target page within the hp arrives */
+    if ((bitmap_offset + 1) & (mis->postcopy_pmi.host_bits - 1)) {
+        DPRINTF("%s: Skipping incomplete hp host=%p from=%p bitmap_offset=%lx",
+                __func__, host, from, bitmap_offset);
+        mis->postcopy_place_skipped = bitmap_offset;
+        return 0;
+    }
+
+    /*
+     * If we skip a page (above) we should end up placing that page before
+     * doing anything with other host pages.
+     */
+    if (mis->postcopy_place_skipped != -1) {
+        assert((bitmap_offset & ~(mis->postcopy_pmi.host_bits - 1)) ==
+               (mis->postcopy_place_skipped &
+                ~(mis->postcopy_pmi.host_bits - 1)));
+    }
+    mis->postcopy_place_skipped = -1;
+
+    /* Adjust pointers to point to start of host page */
+    host = (void *)((uintptr_t)host & ~(hps - 1));
+    from = (void *)((uintptr_t)from & ~(hps - 1));
+    bitmap_offset -= (mis->postcopy_pmi.host_bits - 1);
+
+    if (syscall(__NR_remap_anon_pages, host, from, hps, 0) !=
+            getpagesize()) {
+        perror("remap_anon_pages in postcopy_place_page");
+        fprintf(stderr, "host: %p from: %p pmi=%d\n", host, from,
+                postcopy_pmi_get_state(mis, bitmap_offset));
+
+        return -errno;
+    }
+
+    tmp_state = postcopy_pmi_get_state(mis, bitmap_offset);
+    do {
+        old_state = tmp_state;
+        tmp_state = postcopy_pmi_change_state(mis, bitmap_offset, old_state,
+                                              POSTCOPY_PMI_RECEIVED);
+
+    } while (old_state != tmp_state);
+
+
+    if (old_state == POSTCOPY_PMI_REQUESTED) {
+        /* TODO: Notify kernel */
+    }
+
+    return 0;
+}
+
+/*
+ * Returns a target page of memory that can be mapped at a later point in time
+ * using postcopy_place_page
+ * The same address is used repeatedly, postcopy_place_page just takes the
+ * backing page away.
+ * Returns: Pointer to allocated page
+ *
+ * Note this is a target page and uses the bitmap_offset to get an offset
+ * into a hostpage; since there's only one real temporary host page the caller
+ * is expected to not flip around between pages.
+ */
+void *postcopy_get_tmp_page(MigrationIncomingState *mis, long bitmap_offset)
+{
+    ptrdiff_t offset;
+
+    if (!mis->postcopy_tmp_page) {
+        mis->postcopy_tmp_page = mmap(NULL, getpagesize(),
+                             PROT_READ | PROT_WRITE, MAP_PRIVATE |
+                             MAP_ANONYMOUS, -1, 0);
+        if (!mis->postcopy_tmp_page) {
+            perror("mapping postcopy tmp page");
+            return NULL;
+        }
+        if (madvise(mis->postcopy_tmp_page, getpagesize(), MADV_DONTFORK)) {
+            munmap(mis->postcopy_tmp_page, getpagesize());
+            perror("postcpy tmp page DONTFORK");
+            return NULL;
+        }
+    }
+
+    /*
+     * Get the offset within the host page based on bitmap_offset.
+     */
+    offset = (bitmap_offset & (mis->postcopy_pmi.host_bits - 1)) <<
+                 qemu_target_page_bits();
+
+    return (void *)((uint8_t *)mis->postcopy_tmp_page + offset);
+}
+
 #else
 /* No target OS support, stubs just fail */
 int postcopy_ram_hosttest(void)
@@ -598,6 +721,24 @@ int postcopy_ram_enable_notify(MigrationIncomingState *mis)
 {
     assert(0);
 }
+
+int postcopy_place_zero_page(MigrationIncomingState *mis, void *host,
+                             long bitmap_offset)
+{
+    assert(0);
+}
+
+int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
+                        long bitmap_offset)
+{
+    assert(0);
+}
+
+void *postcopy_get_tmp_page(MigrationIncomingState *mis, long bitmap_offset)
+{
+    assert(0);
+}
+
 #endif
 
 /* ------------------------------------------------------------------------- */
