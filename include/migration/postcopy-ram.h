@@ -19,6 +19,18 @@
 int postcopy_ram_hosttest(void);
 
 /*
+ * Initialise postcopy-ram, setting the RAM to a state where we can go into
+ * postcopy later; must be called prior to any precopy.
+ * called from arch_init's similarly named ram_postcopy_incoming_init
+ */
+int postcopy_ram_incoming_init(MigrationIncomingState *mis, size_t ram_pages);
+
+/*
+ * At the end of a migration where postcopy_ram_incoming_init was called.
+ */
+int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis);
+
+/*
  * In 'advise' mode record that a page has been received.
  */
 void postcopy_hook_early_receive(MigrationIncomingState *mis,
