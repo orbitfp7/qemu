@@ -1499,6 +1499,7 @@ postcopy_discard_send_finish(const char *ramblock, int nwords, int ncmds) "%s ma
 postcopy_cleanup_area(const char *ramblock, void *host_addr, size_t offset, size_t length) "%s: %p offset=%zx length=%zx"
 postcopy_ram_discard_range(void *start, void *end) "%p,%p"
 postcopy_init_area(const char *ramblock, void *host_addr, size_t offset, size_t length) "%s: %p offset=%zx length=%zx"
+postcopy_place_page(void *host_addr, bool all_zero) "host=%p all_zero=%d"
 
 # kvm-all.c
 kvm_ioctl(int type, void *arg) "type 0x%x, arg %p"

@@ -82,6 +82,7 @@ struct MigrationIncomingState {
     int            userfault_fd;
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
+    void          *postcopy_tmp_page;
 };
 
 MigrationIncomingState *migration_incoming_get_current(void);
