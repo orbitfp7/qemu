@@ -854,10 +854,51 @@ int qemu_savevm_state_iterate(QEMUFile *f)
     return ret;
 }
 
+/*
+ * Calls the complete routines just for those devices that are postcopiable;
+ * causing the last few pages to be sent immediately and doing any associated
+ * cleanup.
+ * Note postcopy also calls the plain qemu_savevm_state_complete to complete
+ * all the other devices, but that happens at the point we switch to postcopy.
+ */
+void qemu_savevm_state_postcopy_complete(QEMUFile *f)
+{
+    SaveStateEntry *se;
+    int ret;
+
+    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+        if (!se->ops || !se->ops->save_live_complete ||
+            !se->ops->can_postcopy) {
+            continue;
+        }
+        if (se->ops && se->ops->is_active) {
+            if (!se->ops->is_active(se->opaque)) {
+                continue;
+            }
+        }
+        trace_savevm_section_start(se->idstr, se->section_id);
+        /* Section type */
+        qemu_put_byte(f, QEMU_VM_SECTION_END);
+        qemu_put_be32(f, se->section_id);
+
+        ret = se->ops->save_live_complete(f, se->opaque);
+        trace_savevm_section_end(se->idstr, se->section_id);
+        if (ret < 0) {
+            qemu_file_set_error(f, ret);
+            return;
+        }
+    }
+
+    qemu_savevm_send_postcopy_ram_end(f, 0 /* Good */);
+    qemu_put_byte(f, QEMU_VM_EOF);
+    qemu_fflush(f);
+}
+
 void qemu_savevm_state_complete(QEMUFile *f)
 {
     SaveStateEntry *se;
     int ret;
+    bool in_postcopy = migration_postcopy_phase(migrate_get_current());
 
     trace_savevm_state_complete();
 
@@ -871,6 +912,11 @@ void qemu_savevm_state_complete(QEMUFile *f)
             if (!se->ops->is_active(se->opaque)) {
                 continue;
             }
+        }
+        if (in_postcopy && se->ops &&  se->ops->can_postcopy &&
+            se->ops->can_postcopy(se->opaque)) {
+            DPRINTF("%s: Skipping %s in postcopy", __func__, se->idstr);
+            continue;
         }
         trace_savevm_section_start(se->idstr, se->section_id);
         /* Section type */
@@ -908,7 +954,11 @@ void qemu_savevm_state_complete(QEMUFile *f)
         trace_savevm_section_end(se->idstr, se->section_id);
     }
 
-    qemu_put_byte(f, QEMU_VM_EOF);
+    if (!in_postcopy) {
+        /* Postcopy stream will still be going */
+        qemu_put_byte(f, QEMU_VM_EOF);
+    }
+
     qemu_fflush(f);
 }
 
