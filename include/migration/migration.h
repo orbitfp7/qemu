@@ -84,6 +84,8 @@ struct MigrationIncomingState {
 
     PostcopyState postcopy_state;
 
+    /* For the kernel to send us notifications */
+    int            userfault_fd;
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
     PostcopyPMI    postcopy_pmi;
@@ -206,6 +208,7 @@ int ram_postcopy_send_discard_bitmap(MigrationState *ms);
 /* For incoming postcopy discard */
 int ram_discard_range(MigrationIncomingState *mis, const char *block_name,
                       uint64_t start, uint64_t end);
+int ram_postcopy_incoming_init(MigrationIncomingState *mis);
 
 /**
  * @migrate_add_blocker - prevent migration from proceeding

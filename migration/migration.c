@@ -88,6 +88,7 @@ MigrationIncomingState *migration_incoming_state_new(QEMUFile* f)
 
 void migration_incoming_state_destroy(void)
 {
+    postcopy_pmi_destroy(mis_current);
     loadvm_free_handlers(mis_current);
     g_free(mis_current);
     mis_current = NULL;
