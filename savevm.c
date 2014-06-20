@@ -865,12 +865,54 @@ int qemu_savevm_state_iterate(QEMUFile *f)
     return ret;
 }
 
+/*
+ * Calls the complete routines just for those devices that are postcopiable;
+ * causing the last few pages to be sent immediately and doing any associated
+ * cleanup.
+ * Note postcopy also calls the plain qemu_savevm_state_complete to complete
+ * all the other devices, but that happens at the point we switch to postcopy.
+ */
+void qemu_savevm_state_postcopy_complete(QEMUFile *f)
+{
+    SaveStateEntry *se;
+    int ret;
+
+    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+        if (!se->ops || !se->ops->save_live_complete ||
+            !(se->ops->can_postcopy &&
+              se->ops->can_postcopy(se->opaque))) {
+            continue;
+        }
+        if (se->ops && se->ops->is_active) {
+            if (!se->ops->is_active(se->opaque)) {
+                continue;
+            }
+        }
+        trace_savevm_section_start(se->idstr, se->section_id);
+        /* Section type */
+        qemu_put_byte(f, QEMU_VM_SECTION_END);
+        qemu_put_be32(f, se->section_id);
+
+        ret = se->ops->save_live_complete(f, se->opaque);
+        trace_savevm_section_end(se->idstr, se->section_id, ret);
+        if (ret < 0) {
+            qemu_file_set_error(f, ret);
+            return;
+        }
+    }
+
+    qemu_savevm_send_postcopy_end(f, 0 /* Good */);
+    qemu_put_byte(f, QEMU_VM_EOF);
+    qemu_fflush(f);
+}
+
 void qemu_savevm_state_complete(QEMUFile *f)
 {
     QJSON *vmdesc;
     int vmdesc_len;
     SaveStateEntry *se;
     int ret;
+    bool in_postcopy = migration_postcopy_phase(migrate_get_current());
 
     trace_savevm_state_complete();
 
@@ -884,6 +926,11 @@ void qemu_savevm_state_complete(QEMUFile *f)
             if (!se->ops->is_active(se->opaque)) {
                 continue;
             }
+        }
+        if (in_postcopy && se->ops &&  se->ops->can_postcopy &&
+            se->ops->can_postcopy(se->opaque)) {
+            trace_qemu_savevm_state_complete_skip_for_postcopy(se->idstr);
+            continue;
         }
         trace_savevm_section_start(se->idstr, se->section_id);
         /* Section type */
@@ -931,15 +978,17 @@ void qemu_savevm_state_complete(QEMUFile *f)
         trace_savevm_section_end(se->idstr, se->section_id, 0);
     }
 
-    qemu_put_byte(f, QEMU_VM_EOF);
-
     json_end_array(vmdesc);
     qjson_finish(vmdesc);
-    vmdesc_len = strlen(qjson_get_str(vmdesc));
+    if (!in_postcopy) {
+        /* Postcopy stream will still be going */
+        qemu_put_byte(f, QEMU_VM_EOF);
+        vmdesc_len = strlen(qjson_get_str(vmdesc));
 
-    qemu_put_byte(f, QEMU_VM_VMDESCRIPTION);
-    qemu_put_be32(f, vmdesc_len);
-    qemu_put_buffer(f, (uint8_t *)qjson_get_str(vmdesc), vmdesc_len);
+        qemu_put_byte(f, QEMU_VM_VMDESCRIPTION);
+        qemu_put_be32(f, vmdesc_len);
+        qemu_put_buffer(f, (uint8_t *)qjson_get_str(vmdesc), vmdesc_len);
+    }
     object_unref(OBJECT(vmdesc));
 
     qemu_fflush(f);
