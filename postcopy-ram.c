@@ -23,6 +23,8 @@
 #include "qemu-common.h"
 #include "migration/migration.h"
 #include "migration/postcopy-ram.h"
+#include "qemu/bitmap.h"
+#include "qemu/error-report.h"
 #include "sysemu/sysemu.h"
 
 //#define DEBUG_POSTCOPY
@@ -73,6 +75,140 @@
 #ifndef USERFAULTFD_PROTOCOL
 #define USERFAULTFD_PROTOCOL (uint64_t)0xaa
 #endif
+
+/* ---------------------------------------------------------------------- */
+/* Postcopy pagemap-inbound (pmi) - data structures that record the       */
+/* state of each page used by the inbound postcopy                        */
+
+static void postcopy_pmi_init(MigrationIncomingState *mis, size_t ram_pages)
+{
+    qemu_mutex_init(&mis->postcopy_pmi.mutex);
+    mis->postcopy_pmi.received_map = bitmap_new(ram_pages);
+    mis->postcopy_pmi.requested_map = bitmap_new(ram_pages);
+    bitmap_clear(mis->postcopy_pmi.received_map, 0, ram_pages);
+    bitmap_clear(mis->postcopy_pmi.requested_map, 0, ram_pages);
+}
+
+void postcopy_pmi_destroy(MigrationIncomingState *mis)
+{
+    if (mis->postcopy_pmi.received_map) {
+        g_free(mis->postcopy_pmi.received_map);
+        mis->postcopy_pmi.received_map = NULL;
+    }
+    if (mis->postcopy_pmi.requested_map) {
+        g_free(mis->postcopy_pmi.requested_map);
+        mis->postcopy_pmi.requested_map = NULL;
+    }
+    qemu_mutex_destroy(&mis->postcopy_pmi.mutex);
+}
+
+/*
+ * Mark a set of pages in the PMI as being clear; this is used by the discard
+ * at the start of postcopy, and before the postcopy stream starts.
+ */
+void postcopy_pmi_discard_range(MigrationIncomingState *mis,
+                                size_t start, size_t npages)
+{
+    bitmap_clear(mis->postcopy_pmi.received_map, start, npages);
+}
+
+/*
+ * Retrieve the state of the given page
+ * Note: This version for use by callers already holding the lock
+ */
+static PostcopyPMIState postcopy_pmi_get_state_nolock(
+                            MigrationIncomingState *mis,
+                            size_t bitmap_index)
+{
+    bool received, requested;
+
+    received = test_bit(bitmap_index, mis->postcopy_pmi.received_map);
+    requested = test_bit(bitmap_index, mis->postcopy_pmi.requested_map);
+
+    if (received) {
+        assert(!requested);
+        return POSTCOPY_PMI_RECEIVED;
+    } else {
+        return requested ? POSTCOPY_PMI_REQUESTED : POSTCOPY_PMI_MISSING;
+    }
+}
+
+/* Retrieve the state of the given page */
+static PostcopyPMIState postcopy_pmi_get_state(MigrationIncomingState *mis,
+                                               size_t bitmap_index)
+{
+    PostcopyPMIState ret;
+    qemu_mutex_lock(&mis->postcopy_pmi.mutex);
+    ret = postcopy_pmi_get_state_nolock(mis, bitmap_index);
+    qemu_mutex_unlock(&mis->postcopy_pmi.mutex);
+
+    return ret;
+}
+
+/*
+ * Set the page state to the given state if the previous state was as expected
+ * Return the actual previous state.
+ */
+static PostcopyPMIState postcopy_pmi_change_state(MigrationIncomingState *mis,
+                                           size_t bitmap_index,
+                                           PostcopyPMIState expected_state,
+                                           PostcopyPMIState new_state)
+{
+    PostcopyPMIState old_state;
+
+    qemu_mutex_lock(&mis->postcopy_pmi.mutex);
+    old_state = postcopy_pmi_get_state_nolock(mis, bitmap_index);
+
+    if (old_state == expected_state) {
+        switch (new_state) {
+        case POSTCOPY_PMI_MISSING:
+          assert(0); /* This shouldn't actually happen - use discard_range */
+          break;
+
+        case POSTCOPY_PMI_REQUESTED:
+          assert(old_state == POSTCOPY_PMI_MISSING);
+          set_bit(bitmap_index, mis->postcopy_pmi.requested_map);
+          break;
+
+        case POSTCOPY_PMI_RECEIVED:
+          assert(old_state == POSTCOPY_PMI_MISSING ||
+                 old_state == POSTCOPY_PMI_REQUESTED);
+          set_bit(bitmap_index, mis->postcopy_pmi.received_map);
+          clear_bit(bitmap_index, mis->postcopy_pmi.requested_map);
+          break;
+        }
+    }
+
+    qemu_mutex_unlock(&mis->postcopy_pmi.mutex);
+    return old_state;
+}
+
+/*
+ * Useful when debugging postcopy, although if it failed early the
+ * received map can be quite sparse and thus big when dumped.
+ */
+void postcopy_pmi_dump(MigrationIncomingState *mis)
+{
+    fprintf(stderr, "postcopy_pmi_dump: requested\n");
+    ram_debug_dump_bitmap(mis->postcopy_pmi.requested_map, false);
+    fprintf(stderr, "postcopy_pmi_dump: received\n");
+    ram_debug_dump_bitmap(mis->postcopy_pmi.received_map, true);
+    fprintf(stderr, "postcopy_pmi_dump: end\n");
+}
+
+/* Called by ram_load prior to mapping the page */
+void postcopy_hook_early_receive(MigrationIncomingState *mis,
+                                 size_t bitmap_index)
+{
+    if (mis->postcopy_ram_state == POSTCOPY_RAM_INCOMING_ADVISE) {
+        /*
+         * If we're in precopy-advise mode we need to track received pages even
+         * though we don't need to place pages atomically yet.
+         * In advise mode there's only a single thread, so don't need locks
+         */
+        set_bit(bitmap_index, mis->postcopy_pmi.received_map);
+    }
+}
 
 int postcopy_ram_hosttest(void)
 {
@@ -169,6 +305,14 @@ int postcopy_ram_discard_range(MigrationIncomingState *mis, void *start,
     error_report("postcopy_ram_discard_range: No OS support");
     return -1;
 }
+
+/* Called by ram_load prior to mapping the page */
+void postcopy_hook_early_receive(MigrationIncomingState *mis,
+                                 size_t bitmap_index)
+{
+    /* We don't support postcopy so don't care */
+}
+
 #endif
 
 /* ------------------------------------------------------------------------- */

@@ -57,6 +57,23 @@ struct MigrationRetPathState {
 
 typedef struct MigrationState MigrationState;
 
+/* Postcopy page-map-incoming - data about each page on the inbound side */
+
+typedef enum {
+   POSTCOPY_PMI_MISSING,   /* page hasn't yet been received */
+   POSTCOPY_PMI_REQUESTED, /* Kernel asked for a page, but we've not got it */
+   POSTCOPY_PMI_RECEIVED   /* We've got the page */
+} PostcopyPMIState;
+
+struct PostcopyPMI {
+    /* TODO: I'm expecting to rework this using some atomic compare-exchange
+     * thing, which will require merging the maps together
+     */
+    QemuMutex      mutex;
+    unsigned long *received_map;  /* Pages that we have received */
+    unsigned long *requested_map; /* Pages that we're sending a request for */
+};
+
 /* State for the incoming migration */
 struct MigrationIncomingState {
     QEMUFile *file;
@@ -71,6 +88,7 @@ struct MigrationIncomingState {
 
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
+    PostcopyPMI    postcopy_pmi;
 };
 
 MigrationIncomingState *migration_incoming_get_current(void);
