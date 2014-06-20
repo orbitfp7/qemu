@@ -1353,6 +1353,17 @@ void ram_handle_compressed(void *host, uint8_t ch, uint64_t size)
     }
 }
 
+/*
+ * Allocate data structures etc needed by incoming migration with postcopy-ram
+ * postcopy-ram's similarly names postcopy_ram_incoming_init does the work
+ */
+int ram_postcopy_incoming_init(MigrationIncomingState *mis)
+{
+    size_t ram_pages = last_ram_offset() >> TARGET_PAGE_BITS;
+
+    return postcopy_ram_incoming_init(mis, ram_pages);
+}
+
 static int ram_load(QEMUFile *f, void *opaque, int version_id)
 {
     int flags = 0, ret = 0;
