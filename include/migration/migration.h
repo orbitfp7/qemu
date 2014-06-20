@@ -86,6 +86,9 @@ struct MigrationIncomingState {
         POSTCOPY_RAM_INCOMING_END
     } postcopy_ram_state;
 
+    QemuThread     fault_thread;
+    QemuSemaphore  fault_thread_sem;
+
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
     PostcopyPMI    postcopy_pmi;

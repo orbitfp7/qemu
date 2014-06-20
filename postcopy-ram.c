@@ -408,8 +408,31 @@ static int postcopy_ram_sensitise_area(const char *block_name, void *host_addr,
     return 0;
 }
 
+/*
+ * Handle faults detected by the USERFAULT markings
+ */
+static void *postcopy_ram_fault_thread(void *opaque)
+{
+    MigrationIncomingState *mis = (MigrationIncomingState *)opaque;
+
+    fprintf(stderr, "postcopy_ram_fault_thread\n");
+    /* TODO: In later patch */
+    qemu_sem_post(&mis->fault_thread_sem);
+    while (1) {
+        /* TODO: In later patch */
+    }
+
+    return NULL;
+}
+
 int postcopy_ram_enable_notify(MigrationIncomingState *mis)
 {
+    /* Create the fault handler thread and wait for it to be ready */
+    qemu_sem_init(&mis->fault_thread_sem, 0);
+    qemu_thread_create(&mis->fault_thread, "postcopy/fault",
+                       postcopy_ram_fault_thread, mis, QEMU_THREAD_JOINABLE);
+    qemu_sem_wait(&mis->fault_thread_sem);
+
     /* Mark so that we get notified of accesses to unwritten areas */
     if (qemu_ram_foreach_block(postcopy_ram_sensitise_area, NULL)) {
         return -1;
