@@ -1497,6 +1497,7 @@ rdma_start_outgoing_migration_after_rdma_source_init(void) ""
 postcopy_discard_send_finish(const char *ramblock, int nwords, int ncmds) "%s mask words sent=%d in %d commands"
 postcopy_cleanup_area(const char *ramblock, void *host_addr, size_t offset, size_t length) "%s: %p offset=%zx length=%zx"
 postcopy_init_area(const char *ramblock, void *host_addr, size_t offset, size_t length) "%s: %p offset=%zx length=%zx"
+postcopy_place_page(unsigned long offset, void *host_addr, bool all_zero, int old_state) "offset=%lx host=%p all_zero=%d old_state=%d"
 
 # kvm-all.c
 kvm_ioctl(int type, void *arg) "type 0x%x, arg %p"

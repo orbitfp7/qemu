@@ -197,7 +197,6 @@ static PostcopyPMIState postcopy_pmi_get_state_nolock(
 }
 
 /* Retrieve the state of the given page */
-__attribute__ (( unused )) /* Until later in patch series */
 static PostcopyPMIState postcopy_pmi_get_state(MigrationIncomingState *mis,
                                                size_t bitmap_index)
 {
@@ -213,7 +212,6 @@ static PostcopyPMIState postcopy_pmi_get_state(MigrationIncomingState *mis,
  * Set the page state to the given state if the previous state was as expected
  * Return the actual previous state.
  */
-__attribute__ (( unused )) /* Until later in patch series */
 static PostcopyPMIState postcopy_pmi_change_state(MigrationIncomingState *mis,
                                            size_t bitmap_index,
                                            PostcopyPMIState expected_state,
@@ -477,6 +475,7 @@ static int cleanup_area(const char *block_name, void *host_addr,
 int postcopy_ram_incoming_init(MigrationIncomingState *mis, size_t ram_pages)
 {
     postcopy_pmi_init(mis, ram_pages);
+    mis->postcopy_place_skipped = -1;
 
     if (qemu_ram_foreach_block(init_area, mis)) {
         return -1;
@@ -495,6 +494,10 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
         return -1;
     }
 
+    if (mis->postcopy_tmp_page) {
+        munmap(mis->postcopy_tmp_page, getpagesize());
+        mis->postcopy_tmp_page = NULL;
+    }
     return 0;
 }
 
@@ -561,6 +564,100 @@ int postcopy_ram_enable_notify(MigrationIncomingState *mis)
     return 0;
 }
 
+/*
+ * Place a host page (from) at (host) tomically
+ *    There are restrictions on how 'from' must be mapped, in general best
+ *    to use other postcopy_ routines to allocate.
+ * all_zero: Hint that the page being placed is 0 throughout
+ * returns 0 on success
+ * bitmap_offset: Index into the migration bitmaps
+ *
+ * State changes:
+ *   none -> received
+ *   requested -> received (ack)
+ *
+ * Note the UF thread is also updating the state, and maybe none->requested
+ * at the same time.
+ */
+int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
+                        long bitmap_offset, bool all_zero)
+{
+    PostcopyPMIState old_state, tmp_state, new_state;
+
+    if (!all_zero) {
+        struct uffdio_copy copy_struct;
+
+        copy_struct.dst = (uint64_t)(uintptr_t)host;
+        copy_struct.src = (uint64_t)(uintptr_t)from;
+        copy_struct.len = getpagesize();
+        copy_struct.mode = 0;
+
+        /* copy also acks to the kernel waking the stalled thread up
+         * TODO: We can inhibit that ack and only do it if it was requested
+         * which would be slightly cheaper, but we'd have to be careful
+         * of the order of updating our page state.
+         */
+        if (ioctl(mis->userfault_fd, UFFDIO_COPY, &copy_struct)) {
+            int e = errno;
+            error_report("%s: %s copy host: %p from: %p pmi=%d",
+                         __func__, strerror(e), host, from,
+                         postcopy_pmi_get_state(mis, bitmap_offset));
+
+            return -e;
+        }
+    } else {
+        struct uffdio_zeropage zero_struct;
+
+        zero_struct.range.start = (uint64_t)(uintptr_t)host;
+        zero_struct.range.len = getpagesize();
+        zero_struct.mode = 0;
+
+        if (ioctl(mis->userfault_fd, UFFDIO_ZEROPAGE, &zero_struct)) {
+            int e = errno;
+            error_report("%s: %s zero host: %p from: %p pmi=%d",
+                         __func__, strerror(e), host, from,
+                         postcopy_pmi_get_state(mis, bitmap_offset));
+
+            return -e;
+        }
+    }
+
+    bitmap_offset &= ~(mis->postcopy_pmi.host_bits-1);
+    new_state = POSTCOPY_PMI_RECEIVED;
+    tmp_state = postcopy_pmi_get_state(mis, bitmap_offset);
+    do {
+        old_state = tmp_state;
+        tmp_state = postcopy_pmi_change_state(mis, bitmap_offset, old_state,
+                                              new_state);
+    } while (old_state != tmp_state);
+    trace_postcopy_place_page(bitmap_offset, host, all_zero, old_state);
+
+    return 0;
+}
+
+/*
+ * Returns a target page of memory that can be mapped at a later point in time
+ * using postcopy_place_page
+ * The same address is used repeatedly, postcopy_place_page just takes the
+ * backing page away.
+ * Returns: Pointer to allocated page
+ *
+ */
+void *postcopy_get_tmp_page(MigrationIncomingState *mis)
+{
+    if (!mis->postcopy_tmp_page) {
+        mis->postcopy_tmp_page = mmap(NULL, getpagesize(),
+                             PROT_READ | PROT_WRITE, MAP_PRIVATE |
+                             MAP_ANONYMOUS, -1, 0);
+        if (!mis->postcopy_tmp_page) {
+            perror("mapping postcopy tmp page");
+            return NULL;
+        }
+    }
+
+    return mis->postcopy_tmp_page;
+}
+
 #else
 /* No target OS support, stubs just fail */
 bool postcopy_ram_supported_by_host(void)
@@ -608,6 +705,18 @@ int postcopy_ram_enable_notify(MigrationIncomingState *mis)
 {
     assert(0);
 }
+
+int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
+                        long bitmap_offset, bool all_zero)
+{
+    assert(0);
+}
+
+void *postcopy_get_tmp_page(MigrationIncomingState *mis)
+{
+    assert(0);
+}
+
 #endif
 
 /* ------------------------------------------------------------------------- */
