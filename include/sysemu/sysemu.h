@@ -108,6 +108,7 @@ void qemu_savevm_state_begin(QEMUFile *f,
                              const MigrationParams *params);
 void qemu_savevm_state_header(QEMUFile *f);
 int qemu_savevm_state_iterate(QEMUFile *f);
+void qemu_savevm_state_complete_postcopy(QEMUFile *f);
 void qemu_savevm_state_complete_precopy(QEMUFile *f);
 void qemu_savevm_state_cancel(void);
 void qemu_savevm_state_pending(QEMUFile *f, uint64_t max_size,
