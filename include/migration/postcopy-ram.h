@@ -59,6 +59,29 @@ int postcopy_send_discard_bm_ram(MigrationState *ms, const char *name,
 void postcopy_hook_early_receive(MigrationIncomingState *mis,
                                  size_t bitmap_index);
 
+/*
+ * Place a zero'd page of memory at *host
+ * returns 0 on success
+ */
+int postcopy_place_zero_page(MigrationIncomingState *mis, void *host,
+                             long bitmap_offset);
+
+/*
+ * Place a page (from) at (host) efficiently
+ *    There are restrictions on how 'from' must be mapped, in general best
+ *    to use other postcopy_ routines to allocate.
+ * returns 0 on success
+ */
+int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
+                        long bitmap_offset);
+
+/*
+ * Allocate a page of memory that can be mapped at a later point in time
+ * using postcopy_place_page
+ * Returns: Pointer to allocated page
+ */
+void *postcopy_get_tmp_page(MigrationIncomingState *mis);
+
 void postcopy_pmi_destroy(MigrationIncomingState *mis);
 void postcopy_pmi_discard_range(MigrationIncomingState *mis,
                                 size_t start, size_t npages);

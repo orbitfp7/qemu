@@ -93,6 +93,7 @@ struct MigrationIncomingState {
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
     PostcopyPMI    postcopy_pmi;
+    void          *postcopy_tmp_page;
 };
 
 MigrationIncomingState *migration_incoming_get_current(void);

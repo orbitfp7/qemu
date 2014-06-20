@@ -385,6 +385,10 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
         return -1;
     }
 
+    if (mis->postcopy_tmp_page) {
+        munmap(mis->postcopy_tmp_page, getpagesize());
+        mis->postcopy_tmp_page = NULL;
+    }
     return 0;
 }
 
@@ -441,6 +445,88 @@ int postcopy_ram_enable_notify(MigrationIncomingState *mis)
     return 0;
 }
 
+/*
+ * Place a zero'd page of memory at *host
+ * returns 0 on success
+ * bitmap_offset: Index into the migration bitmaps
+ */
+int postcopy_place_zero_page(MigrationIncomingState *mis, void *host,
+                             long bitmap_offset)
+{
+    void *tmp = postcopy_get_tmp_page(mis);
+    if (!tmp) {
+        return -ENOMEM;
+    }
+    *(char *)tmp = 0;
+    return postcopy_place_page(mis, host, tmp, bitmap_offset);
+}
+
+/*
+ * Place a page (from) at (host) efficiently
+ *    There are restrictions on how 'from' must be mapped, in general best
+ *    to use other postcopy_ routines to allocate.
+ * returns 0 on success
+ * bitmap_offset: Index into the migration bitmaps
+ */
+int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
+                        long bitmap_offset)
+{
+    PostcopyPMIState old_state, tmp_state;
+
+    if (syscall(__NR_remap_anon_pages, host, from, getpagesize(), 0) !=
+            getpagesize()) {
+        perror("remap_anon_pages in postcopy_place_page");
+        fprintf(stderr, "host: %p from: %p pmi=%d\n", host, from,
+                postcopy_pmi_get_state(mis, bitmap_offset));
+
+        return -errno;
+    }
+
+    tmp_state = postcopy_pmi_get_state(mis, bitmap_offset);
+    do {
+        old_state = tmp_state;
+        tmp_state = postcopy_pmi_change_state(mis, bitmap_offset, old_state,
+                                              POSTCOPY_PMI_RECEIVED);
+
+    } while (old_state != tmp_state);
+
+
+    if (old_state == POSTCOPY_PMI_REQUESTED) {
+        /* TODO: Notify kernel */
+    }
+
+    /* TODO: hostpagesize!=targetpagesize case */
+    return 0;
+}
+
+/*
+ * Returns a page of memory that can be mapped at a later point in time
+ * using postcopy_place_page
+ * The same address is used repeatedly, postcopy_place_page just takes the
+ * backing page away.
+ * Returns: Pointer to allocated page
+ */
+void *postcopy_get_tmp_page(MigrationIncomingState *mis)
+{
+
+    if (!mis->postcopy_tmp_page) {
+        mis->postcopy_tmp_page = mmap(NULL, getpagesize(),
+                             PROT_READ | PROT_WRITE, MAP_PRIVATE |
+                             MAP_ANONYMOUS, -1, 0);
+        if (!mis->postcopy_tmp_page) {
+            perror("mapping postcopy tmp page");
+            return NULL;
+        }
+        if (madvise(mis->postcopy_tmp_page, getpagesize(), MADV_DONTFORK)) {
+            munmap(mis->postcopy_tmp_page, getpagesize());
+            perror("postcpy tmp page DONTFORK");
+            return NULL;
+        }
+    }
+
+    return mis->postcopy_tmp_page;
+}
+
 #else
 /* No target OS support, stubs just fail */
 int postcopy_ram_hosttest(void)
@@ -480,6 +566,25 @@ int postcopy_ram_enable_notify(MigrationIncomingState *mis)
     fprintf(stderr, "postcopy_ram_enable_notify: No OS support\n");
     return -1;
 }
+
+int postcopy_place_zero_page(MigrationIncomingState *mis, void *host)
+{
+    error_report("postcopy_place_zero_page: No OS support");
+    return -1;
+}
+
+int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from)
+{
+    error_report("postcopy_place_page: No OS support");
+    return -1;
+}
+
+void *postcopy_get_tmp_page(MigrationIncomingState *mis)
+{
+    error_report("postcopy_get_tmp_page: No OS support");
+    return -1;
+}
+
 #endif
 
 /* ------------------------------------------------------------------------- */
