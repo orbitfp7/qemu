@@ -87,6 +87,7 @@ enum qemu_vm_cmd {
     MIG_CMD_INVALID = 0,       /* Must be 0 */
     MIG_CMD_OPEN_RETURN_PATH,  /* Tell the dest to open the Return path */
     MIG_CMD_PING,              /* Request a PONG on the RP */
+    MIG_CMD_PACKAGED,          /* Send a wrapped stream within this stream */
 
     MIG_CMD_POSTCOPY_ADVISE = 20,  /* Prior to any page transfers, just
                                       warn we might want to do PC */
@@ -100,6 +101,8 @@ enum qemu_vm_cmd {
 
 };
 
+#define MAX_VM_CMD_PACKAGED_SIZE (1ul << 24)
+
 bool qemu_savevm_state_blocked(Error **errp);
 void qemu_savevm_state_begin(QEMUFile *f,
                              const MigrationParams *params);
@@ -112,6 +115,7 @@ void qemu_savevm_command_send(QEMUFile *f, enum qemu_vm_cmd command,
                               uint16_t len, uint8_t *data);
 void qemu_savevm_send_ping(QEMUFile *f, uint32_t value);
 void qemu_savevm_send_open_return_path(QEMUFile *f);
+int qemu_savevm_send_packaged(QEMUFile *f, const QEMUSizedBuffer *qsb);
 void qemu_savevm_send_postcopy_advise(QEMUFile *f);
 void qemu_savevm_send_postcopy_listen(QEMUFile *f);
 void qemu_savevm_send_postcopy_run(QEMUFile *f);
