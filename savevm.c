@@ -915,6 +915,26 @@ static SaveStateEntry *find_se(const char *idstr, int instance_id)
     return NULL;
 }
 
+/* These are ORable flags */
+const int LOADVM_EXITCODE_QUITLOOP     =  1;
+const int LOADVM_EXITCODE_QUITPARENT   =  2;
+const int LOADVM_EXITCODE_KEEPHANDLERS =  4;
+
+typedef struct LoadStateEntry {
+    QLIST_ENTRY(LoadStateEntry) entry;
+    SaveStateEntry *se;
+    int section_id;
+    int version_id;
+} LoadStateEntry;
+
+typedef QLIST_HEAD(, LoadStateEntry) LoadStateEntry_Head;
+
+static LoadStateEntry_Head loadvm_handlers =
+ QLIST_HEAD_INITIALIZER(loadvm_handlers);
+
+static int qemu_loadvm_state_main(QEMUFile *f,
+                                  LoadStateEntry_Head *loadvm_handlers);
+
 static int loadvm_process_command_simple_lencheck(const char *name,
                                                   unsigned int actual,
                                                   unsigned int expected)
@@ -931,8 +951,11 @@ static int loadvm_process_command_simple_lencheck(const char *name,
 /*
  * Process an incoming 'QEMU_VM_COMMAND'
  * negative return on error (will issue error message)
+ * 0   just a normal return
+ * 1   All good, but exit the loop
  */
-static int loadvm_process_command(QEMUFile *f)
+static int loadvm_process_command(QEMUFile *f,
+                                  LoadStateEntry_Head *loadvm_handlers)
 {
     MigrationIncomingState *mis = migration_incoming_get_current();
     uint16_t com;
@@ -982,39 +1005,13 @@ static int loadvm_process_command(QEMUFile *f)
     return 0;
 }
 
-typedef struct LoadStateEntry {
-    QLIST_ENTRY(LoadStateEntry) entry;
-    SaveStateEntry *se;
-    int section_id;
-    int version_id;
-} LoadStateEntry;
-
-int qemu_loadvm_state(QEMUFile *f)
+static int qemu_loadvm_state_main(QEMUFile *f,
+                                  LoadStateEntry_Head *loadvm_handlers)
 {
-    QLIST_HEAD(, LoadStateEntry) loadvm_handlers =
-        QLIST_HEAD_INITIALIZER(loadvm_handlers);
-    LoadStateEntry *le, *new_le;
+    LoadStateEntry *le;
     uint8_t section_type;
-    unsigned int v;
     int ret;
-
-    if (qemu_savevm_state_blocked(NULL)) {
-        return -EINVAL;
-    }
-
-    v = qemu_get_be32(f);
-    if (v != QEMU_VM_FILE_MAGIC) {
-        return -EINVAL;
-    }
-
-    v = qemu_get_be32(f);
-    if (v == QEMU_VM_FILE_VERSION_COMPAT) {
-        error_report("SaveVM v2 format is obsolete and don't work anymore");
-        return -ENOTSUP;
-    }
-    if (v != QEMU_VM_FILE_VERSION) {
-        return -ENOTSUP;
-    }
+    int exitcode = 0;
 
     while ((section_type = qemu_get_byte(f)) != QEMU_VM_EOF) {
         uint32_t instance_id, version_id, section_id;
@@ -1043,16 +1040,14 @@ int qemu_loadvm_state(QEMUFile *f)
             if (se == NULL) {
                 error_report("Unknown savevm section or instance '%s' %d",
                              idstr, instance_id);
-                ret = -EINVAL;
-                goto out;
+                return -EINVAL;
             }
 
             /* Validate version */
             if (version_id > se->version_id) {
                 error_report("savevm: unsupported version %d for '%s' v%d",
                         version_id, idstr, se->version_id);
-                ret = -EINVAL;
-                goto out;
+                return -EINVAL;
             }
 
             /* Add entry */
@@ -1061,14 +1056,14 @@ int qemu_loadvm_state(QEMUFile *f)
             le->se = se;
             le->section_id = section_id;
             le->version_id = version_id;
-            QLIST_INSERT_HEAD(&loadvm_handlers, le, entry);
+            QLIST_INSERT_HEAD(loadvm_handlers, le, entry);
 
             ret = vmstate_load(f, le->se, le->version_id);
             if (ret < 0) {
                 error_report("qemu: error while loading state for"
                              "instance 0x%x of device '%s'",
                              instance_id, idstr);
-                goto out;
+                return ret;
             }
             break;
         case QEMU_VM_SECTION_PART:
@@ -1076,47 +1071,84 @@ int qemu_loadvm_state(QEMUFile *f)
             section_id = qemu_get_be32(f);
 
             DPRINTF("QEMU_VM_SECTION_PART/END entry for id=%d", section_id);
-            QLIST_FOREACH(le, &loadvm_handlers, entry) {
+            QLIST_FOREACH(le, loadvm_handlers, entry) {
                 if (le->section_id == section_id) {
                     break;
                 }
             }
             if (le == NULL) {
                 error_report("Unknown savevm section %d", section_id);
-                ret = -EINVAL;
-                goto out;
+                return -EINVAL;
             }
 
             ret = vmstate_load(f, le->se, le->version_id);
             if (ret < 0) {
                 error_report("qemu: error while loading state section"
                              " id %d (%s)", section_id, le->se->idstr);
-                goto out;
+                return ret;
             }
             DPRINTF("QEMU_VM_SECTION_PART/END done for id=%d", section_id);
             break;
         case QEMU_VM_COMMAND:
-            ret = loadvm_process_command(f);
-            if (ret < 0) {
-                goto out;
+            ret = loadvm_process_command(f, loadvm_handlers);
+            DPRINTF("%s QEMU_VM_COMMAND ret: %d", __func__, ret);
+            if ((ret < 0) || (ret & LOADVM_EXITCODE_QUITLOOP)) {
+                return ret;
             }
+            exitcode |= ret; /* Lets us pass flags up to the parent */
             break;
         default:
             error_report("Unknown savevm section type %d", section_type);
-            ret = -EINVAL;
-            goto out;
+            return -EINVAL;
         }
     }
     DPRINTF("qemu_loadvm_state loop: exited loop");
 
-    cpu_synchronize_all_post_init();
+    if (exitcode & LOADVM_EXITCODE_QUITPARENT) {
+        DPRINTF("loadvm_handlers_state_main: End of loop with QUITPARENT");
+        exitcode &= ~LOADVM_EXITCODE_QUITPARENT;
+        exitcode &= LOADVM_EXITCODE_QUITLOOP;
+    }
 
-    ret = 0;
+    return exitcode;
+}
 
-out:
-    QLIST_FOREACH_SAFE(le, &loadvm_handlers, entry, new_le) {
-        QLIST_REMOVE(le, entry);
-        g_free(le);
+int qemu_loadvm_state(QEMUFile *f)
+{
+    LoadStateEntry *le, *new_le;
+    unsigned int v;
+    int ret;
+
+    if (qemu_savevm_state_blocked(NULL)) {
+        return -EINVAL;
+    }
+
+    v = qemu_get_be32(f);
+    if (v != QEMU_VM_FILE_MAGIC) {
+        return -EINVAL;
+    }
+
+    v = qemu_get_be32(f);
+    if (v == QEMU_VM_FILE_VERSION_COMPAT) {
+        error_report("SaveVM v2 format is obsolete and don't work anymore");
+        return -ENOTSUP;
+    }
+    if (v != QEMU_VM_FILE_VERSION) {
+        return -ENOTSUP;
+    }
+
+    QLIST_INIT(&loadvm_handlers);
+    ret = qemu_loadvm_state_main(f, &loadvm_handlers);
+
+    if (ret == 0) {
+        cpu_synchronize_all_post_init();
+    }
+
+    if ((ret < 0) || !(ret & LOADVM_EXITCODE_KEEPHANDLERS)) {
+        QLIST_FOREACH_SAFE(le, &loadvm_handlers, entry, new_le) {
+            QLIST_REMOVE(le, entry);
+            g_free(le);
+        }
     }
 
     if (ret == 0) {
