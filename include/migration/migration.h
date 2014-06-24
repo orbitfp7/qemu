@@ -88,6 +88,18 @@ MigrationIncomingState *migration_incoming_get_current(void);
 MigrationIncomingState *migration_incoming_state_new(QEMUFile *f);
 void migration_incoming_state_destroy(void);
 
+/*
+ * An outstanding page request, on the source, having been received
+ * and queued
+ */
+struct MigrationSrcPageRequest {
+    RAMBlock *rb;
+    hwaddr    offset;
+    hwaddr    len;
+
+    QSIMPLEQ_ENTRY(MigrationSrcPageRequest) next_req;
+};
+
 struct MigrationState
 {
     int64_t bandwidth_limit;
@@ -130,6 +142,12 @@ struct MigrationState
      * of the postcopy phase
      */
     unsigned long *sentmap;
+
+    /* Queue of outstanding page requests from the destination */
+    QemuMutex src_page_req_mutex;
+    QSIMPLEQ_HEAD(src_page_requests, MigrationSrcPageRequest) src_page_requests;
+    /* The RAMBlock used in the last src_page_request */
+    RAMBlock *last_req_rb;
 };
 
 void process_incoming_migration(QEMUFile *f);
@@ -258,6 +276,9 @@ void ram_control_load_hook(QEMUFile *f, uint64_t flags);
 size_t ram_control_save_page(QEMUFile *f, ram_addr_t block_offset,
                              ram_addr_t offset, size_t size,
                              uint64_t *bytes_sent);
+
+int ram_save_queue_pages(MigrationState *ms, const char *rbname,
+                         ram_addr_t start, ram_addr_t len);
 
 PostcopyState postcopy_state_get(MigrationIncomingState *mis);
 
