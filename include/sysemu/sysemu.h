@@ -87,6 +87,7 @@ enum qemu_vm_cmd {
     QEMU_VM_CMD_INVALID = 0,   /* Must be 0 */
     QEMU_VM_CMD_OPENRP,        /* Tell the dest to open the Return path */
     QEMU_VM_CMD_REQACK,        /* Request an ACK on the RP */
+    QEMU_VM_CMD_PACKAGED,      /* Send a wrapped stream within this stream */
 
     QEMU_VM_CMD_POSTCOPY_RAM_ADVISE = 20,  /* Prior to any page transfers, just
                                               warn we might want to do PC */
@@ -101,6 +102,8 @@ enum qemu_vm_cmd {
     QEMU_VM_CMD_AFTERLASTVALID
 };
 
+#define MAX_VM_CMD_PACKAGED_SIZE (1ul << 24)
+
 bool qemu_savevm_state_blocked(Error **errp);
 void qemu_savevm_state_begin(QEMUFile *f,
                              const MigrationParams *params);
@@ -112,6 +115,7 @@ void qemu_savevm_command_send(QEMUFile *f, enum qemu_vm_cmd command,
                               uint16_t len, uint8_t *data);
 void qemu_savevm_send_reqack(QEMUFile *f, uint32_t value);
 void qemu_savevm_send_openrp(QEMUFile *f);
+void qemu_savevm_send_packaged(QEMUFile *f, const QEMUSizedBuffer *qsb);
 void qemu_savevm_send_postcopy_ram_advise(QEMUFile *f);
 void qemu_savevm_send_postcopy_ram_discard(QEMUFile *f, const char *name,
                                            uint16_t len, uint8_t offset,
