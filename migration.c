@@ -899,6 +899,91 @@ static void await_outgoing_return_path_close(MigrationState *ms)
     DPRINTF("%s: Exit", __func__);
 }
 
+/* Switch from normal iteration to postcopy
+ * Returns non-0 on error
+ */
+static int postcopy_start(MigrationState *ms)
+{
+    int ret;
+    const QEMUSizedBuffer *qsb;
+    migrate_set_state(ms, MIG_STATE_ACTIVE, MIG_STATE_POSTCOPY_ACTIVE);
+
+    DPRINTF("postcopy_start\n");
+    qemu_mutex_lock_iothread();
+    DPRINTF("postcopy_start: setting run state\n");
+    ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
+
+    if (ret < 0) {
+        migrate_set_state(ms, MIG_STATE_POSTCOPY_ACTIVE, MIG_STATE_ERROR);
+        qemu_mutex_unlock_iothread();
+        return -1;
+    }
+
+    /*
+     * in Finish migrate and with the io-lock held everything should
+     * be quiet, but we've potentially still got dirty pages and we
+     * need to tell the destination to throw any pages it's already received
+     * that are dirty
+     */
+    if (postcopy_send_discard_bitmap(ms)) {
+        DPRINTF("postcopy send discard bitmap failed\n");
+        migrate_set_state(ms, MIG_STATE_POSTCOPY_ACTIVE, MIG_STATE_ERROR);
+        qemu_mutex_unlock_iothread();
+        return -1;
+    }
+
+    DPRINTF("postcopy_start: sending req 2\n");
+    qemu_savevm_send_reqack(ms->file, 2);
+    /*
+     * send rest of state - note things that are doing postcopy
+     * will notice we're in MIG_STATE_POSTCOPY_ACTIVE and not actually
+     * wrap their state up here
+     */
+    qemu_file_set_rate_limit(ms->file, INT64_MAX);
+    DPRINTF("postcopy_start: do state_complete\n");
+
+    /*
+     * We need to leave the fd free for page transfers during the
+     * loading of the device state, so wrap all the remaining
+     * commands and state into a package that gets sent in one go
+     */
+    QEMUFile *fb = qemu_bufopen("w", NULL);
+
+    qemu_savevm_state_complete(fb);
+    DPRINTF("postcopy_start: sending req 3\n");
+    qemu_savevm_send_reqack(fb, 3);
+
+    qemu_savevm_send_postcopy_ram_run(fb);
+
+    /* <><> end of stuff going into the package */
+    qsb = qemu_buf_get(fb);
+
+    /* Now send that blob */
+    if (qsb_get_length(qsb) > MAX_VM_CMD_PACKAGED_SIZE) {
+        DPRINTF("postcopy_start: Unreasonably large packaged state: %lu\n",
+                (unsigned long)(qsb_get_length(qsb)));
+        migrate_set_state(ms, MIG_STATE_POSTCOPY_ACTIVE, MIG_STATE_ERROR);
+        qemu_mutex_unlock_iothread();
+        qemu_fclose(fb);
+        return -1;
+    }
+    qemu_savevm_send_packaged(ms->file, qsb);
+    qemu_fclose(fb);
+
+    qemu_mutex_unlock_iothread();
+
+    DPRINTF("postcopy_start not finished sending ack\n");
+    qemu_savevm_send_reqack(ms->file, 4);
+
+    ret = qemu_file_get_error(ms->file);
+    if (ret) {
+        error_report("postcopy_start: Migration stream errored");
+        migrate_set_state(ms, MIG_STATE_POSTCOPY_ACTIVE, MIG_STATE_ERROR);
+    }
+
+    return ret;
+}
+
 /*
  * Master migration thread on the source VM.
  * It drives the migration and pumps the data down the outgoing channel.
