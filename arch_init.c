@@ -1328,9 +1328,20 @@ static int load_xbzrle(QEMUFile *f, ram_addr_t addr, void *host)
     return 0;
 }
 
+/*
+ * Read a RAMBlock ID from the stream f, find the host address of the
+ * start of that block and add on 'offset'
+ *
+ * f: Stream to read from
+ * mis: MigrationIncomingState
+ * offset: Offset within the block
+ * flags: Page flags (mostly to see if it's a continuation of previous block)
+ * rb: Pointer to RAMBlock* that gets filled in with the RB we find
+ */
 static inline void *host_from_stream_offset(QEMUFile *f,
+                                            MigrationIncomingState *mis,
                                             ram_addr_t offset,
-                                            int flags)
+                                            int flags, RAMBlock **rb)
 {
     static RAMBlock *block = NULL;
     char id[256];
@@ -1341,8 +1352,11 @@ static inline void *host_from_stream_offset(QEMUFile *f,
             error_report("Ack, bad migration stream!");
             return NULL;
         }
+        if (rb) {
+            *rb = block;
+        }
 
-        return memory_region_get_ram_ptr(block->mr) + offset;
+        goto gotit;
     }
 
     len = qemu_get_byte(f);
@@ -1350,12 +1364,22 @@ static inline void *host_from_stream_offset(QEMUFile *f,
     id[len] = 0;
 
     QTAILQ_FOREACH(block, &ram_list.blocks, next) {
-        if (!strncmp(id, block->idstr, sizeof(id)))
-            return memory_region_get_ram_ptr(block->mr) + offset;
+        if (!strncmp(id, block->idstr, sizeof(id))) {
+            if (rb) {
+                *rb = block;
+            }
+            goto gotit;
+        }
     }
 
     error_report("Can't find block %s!", id);
     return NULL;
+
+gotit:
+    postcopy_hook_early_receive(mis,
+        (offset + (*rb)->offset) >> TARGET_PAGE_BITS);
+    return memory_region_get_ram_ptr(block->mr) + offset;
+
 }
 
 /*
@@ -1385,6 +1409,13 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
     ram_addr_t addr;
     int flags, ret = 0;
     static uint64_t seq_iter;
+    /*
+     * System is running in postcopy mode, page inserts to host memory must be
+     * atomic
+     */
+    MigrationIncomingState *mis = migration_incoming_get_current();
+    bool postcopy_running = mis->postcopy_ram_state >=
+                            POSTCOPY_RAM_INCOMING_LISTENING;
 
     seq_iter++;
 
@@ -1439,8 +1470,9 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
         } else if (flags & RAM_SAVE_FLAG_COMPRESS) {
             void *host;
             uint8_t ch;
+            RAMBlock *rb;
 
-            host = host_from_stream_offset(f, addr, flags);
+            host = host_from_stream_offset(f, mis, addr, flags, &rb);
             if (!host) {
                 error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
                 ret = -EINVAL;
@@ -1448,20 +1480,63 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
             }
 
             ch = qemu_get_byte(f);
-            ram_handle_compressed(host, ch, TARGET_PAGE_SIZE);
+            if (!postcopy_running) {
+                ram_handle_compressed(host, ch, TARGET_PAGE_SIZE);
+            } else {
+                if (!ch) {
+                    ret = postcopy_place_zero_page(mis, host,
+                              (addr + rb->offset) >> TARGET_PAGE_BITS);
+                } else {
+                    void *tmp;
+                    tmp = postcopy_get_tmp_page(mis);
+                    if (!tmp) {
+                        return -ENOMEM;
+                    }
+                    memset(tmp, ch, TARGET_PAGE_SIZE);
+                    ret = postcopy_place_page(mis, host, tmp,
+                              (addr + rb->offset) >> TARGET_PAGE_BITS);
+                }
+                if (ret) {
+                    error_report("ram_load: Failure in postcopy compress @"
+                                 "%zx/%p;%s+%zx",
+                                 addr, host, rb->idstr, rb->offset);
+                    return ret;
+                }
+            }
         } else if (flags & RAM_SAVE_FLAG_PAGE) {
             void *host;
+            RAMBlock *rb;
 
-            host = host_from_stream_offset(f, addr, flags);
+            host = host_from_stream_offset(f, mis, addr, flags, &rb);
             if (!host) {
                 error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
                 ret = -EINVAL;
                 break;
             }
 
-            qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
+            if (!postcopy_running) {
+                qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
+            } else {
+                void *tmp = postcopy_get_tmp_page(mis);
+                if (!tmp) {
+                    return -ENOMEM;
+                }
+                qemu_get_buffer(f, tmp, TARGET_PAGE_SIZE);
+                ret = postcopy_place_page(mis, host, tmp,
+                          (addr + rb->offset) >> TARGET_PAGE_BITS);
+                if (ret) {
+                    error_report("ram_load: Failure in postcopy simple"
+                                 "@%zx/%p;%s+%zx",
+                                 addr, host, rb->idstr, rb->offset);
+                    return ret;
+                }
+            }
         } else if (flags & RAM_SAVE_FLAG_XBZRLE) {
-            void *host = host_from_stream_offset(f, addr, flags);
+            if (postcopy_running) {
+                error_report("XBZRLE RAM block in postcopy mode @%zx\n", addr);
+                return -EINVAL;
+            }
+            void *host = host_from_stream_offset(f, mis, addr, flags, NULL);
             if (!host) {
                 error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
                 ret = -EINVAL;
