@@ -626,6 +626,38 @@ void qemu_savevm_send_openrp(QEMUFile *f)
     qemu_savevm_command_send(f, QEMU_VM_CMD_OPENRP, 0, NULL);
 }
 
+/* We have a buffer of data to send; we don't want that all to be loaded
+ * by the command itself, so the command contains just the length of the
+ * extra buffer that we then send straight after it.
+ * TODO: Must be a better way to organise that
+ */
+void qemu_savevm_send_packaged(QEMUFile *f, const QEMUSizedBuffer *qsb)
+{
+    size_t cur_iov;
+    size_t len = qsb_get_length(qsb);
+    uint32_t tmp;
+
+    tmp = cpu_to_be32(len);
+
+    DPRINTF("send_packaged");
+    qemu_savevm_command_send(f, QEMU_VM_CMD_PACKAGED, 4, (uint8_t *)&tmp);
+
+    /* all the data follows (concatinating the iov's) */
+    for (cur_iov = 0; cur_iov < qsb->n_iov; cur_iov++) {
+        /* The iov entries are partially filled */
+        size_t towrite = (qsb->iov[cur_iov].iov_len > len) ?
+                              len :
+                              qsb->iov[cur_iov].iov_len;
+        len -= towrite;
+
+        if (!towrite) {
+            break;
+        }
+
+        qemu_put_buffer(f, qsb->iov[cur_iov].iov_base, towrite);
+    }
+}
+
 /* Send prior to any RAM transfer */
 void qemu_savevm_send_postcopy_ram_advise(QEMUFile *f)
 {
@@ -1249,6 +1281,48 @@ static int loadvm_process_command_simple_lencheck(const char *name,
     return 0;
 }
 
+/* Immediately following this command is a blob of data containing an embedded
+ * chunk of migration stream; read it and load it.
+ */
+static int loadvm_handle_cmd_packaged(MigrationIncomingState *mis,
+                                      uint32_t length,
+                                      LoadStateEntry_Head *loadvm_handlers)
+{
+    int ret;
+    uint8_t *buffer;
+    QEMUSizedBuffer *qsb;
+
+    DPRINTF("loadvm_handle_cmd_packaged: length=%u", length);
+
+    if (length > MAX_VM_CMD_PACKAGED_SIZE) {
+        error_report("Unreasonably large packaged state: %u", length);
+        return -1;
+    }
+    buffer = g_malloc0(length);
+    ret = qemu_get_buffer(mis->file, buffer, (int)length);
+    if (ret != length) {
+        g_free(buffer);
+        error_report("CMD_PACKAGED: Buffer receive fail ret=%d length=%d\n",
+                ret, length);
+        return (ret < 0) ? ret : -EAGAIN;
+    }
+    DPRINTF("%s: Received %d package, going to load", __func__, ret);
+
+    /* Setup a dummy QEMUFile that actually reads from the buffer */
+    qsb = qsb_create(buffer, length);
+    g_free(buffer); /* Because qsb_create copies */
+    if (!qsb) {
+        error_report("Unable to create qsb");
+    }
+    QEMUFile *packf = qemu_bufopen("r", qsb);
+
+    ret = qemu_loadvm_state_main(packf, loadvm_handlers);
+    DPRINTF("%s: qemu_loadvm_state_main returned %d", __func__, ret);
+    qemu_fclose(packf); /* also frees the qsb */
+
+    return ret;
+}
+
 /*
  * Process an incoming 'QEMU_VM_COMMAND'
  * negative return on error (will issue error message)
@@ -1298,6 +1372,14 @@ static int loadvm_process_command(QEMUFile *f,
         }
         migrate_send_rp_ack(mis, tmp32);
         break;
+
+    case QEMU_VM_CMD_PACKAGED:
+        if (loadvm_process_command_simple_lencheck("CMD_POSTCOPY_RAM_PACKAGED",
+            len, 4)) {
+            return -1;
+         }
+        tmp32 = qemu_get_be32(f);
+        return loadvm_handle_cmd_packaged(mis, tmp32, loadvm_handlers);
 
     case QEMU_VM_CMD_POSTCOPY_RAM_ADVISE:
         if (loadvm_process_command_simple_lencheck("CMD_POSTCOPY_RAM_ADVISE",
