@@ -1265,9 +1265,45 @@ static int loadvm_postcopy_ram_handle_discard(MigrationIncomingState *mis,
     return 0;
 }
 
+typedef struct ram_listen_thread_data {
+    QEMUFile *f;
+    LoadStateEntry_Head *lh;
+} ram_listen_thread_data;
+
+/*
+ * Triggered by a postcopy_listen command; this thread takes over reading
+ * the input stream, leaving the main thread free to carry on loading the rest
+ * of the device state (from RAM).
+ * (TODO:This could do with being in a postcopy file - but there again it's
+ * just another input loop, not that postcopy specific)
+ */
+static void *postcopy_ram_listen_thread(void *opaque)
+{
+    ram_listen_thread_data *rltd = opaque;
+    MigrationIncomingState *mis = migration_incoming_get_current();
+    int load_res;
+
+    qemu_sem_post(&mis->listen_thread_sem);
+    DPRINTF("postcopy_ram_listen_thread start");
+
+    load_res = qemu_loadvm_state_main(rltd->f, rltd->lh);
+
+    DPRINTF("postcopy_ram_listen_thread exiting");
+    if (load_res < 0) {
+        error_report("%s: loadvm failed: %d", __func__, load_res);
+        qemu_file_set_error(rltd->f, load_res);
+    }
+    postcopy_ram_incoming_cleanup(mis);
+    g_free(rltd);
+
+    return NULL;
+}
+
 /* After this message we must be able to immediately receive page data */
 static int loadvm_postcopy_ram_handle_listen(MigrationIncomingState *mis)
 {
+    ram_listen_thread_data *rltd = g_malloc(sizeof(ram_listen_thread_data));
+
     DPRINTF("%s", __func__);
     if (mis->postcopy_ram_state != POSTCOPY_RAM_INCOMING_ADVISE) {
         error_report("CMD_POSTCOPY_RAM_LISTEN in wrong postcopy state (%d)",
@@ -1286,8 +1322,25 @@ static int loadvm_postcopy_ram_handle_listen(MigrationIncomingState *mis)
         return -1;
     }
 
-    /* TODO start up the postcopy listening thread */
-    return 0;
+    if (mis->have_listen_thread) {
+        error_report("CMD_POSTCOPY_RAM_LISTEN already has a listen thread");
+        return -1;
+    }
+
+    mis->have_listen_thread = true;
+    /* Start up the listening thread and wait for it to signal ready */
+    qemu_sem_init(&mis->listen_thread_sem, 0);
+    rltd->f = mis->file;
+    rltd->lh = &loadvm_handlers;
+    qemu_thread_create(&mis->listen_thread, "postcopy/listen",
+                       postcopy_ram_listen_thread, rltd, QEMU_THREAD_JOINABLE);
+    qemu_sem_wait(&mis->listen_thread_sem);
+
+    /*
+     * all good - cause the loop that handled this command to exit because
+     * the new thread is taking over
+     */
+    return LOADVM_EXITCODE_QUITPARENT | LOADVM_EXITCODE_KEEPHANDLERS;
 }
 
 /* After all discards we can start running and asking for pages */
@@ -1606,6 +1659,11 @@ int qemu_loadvm_state(QEMUFile *f)
 
     QLIST_INIT(&loadvm_handlers);
     ret = qemu_loadvm_state_main(f, &loadvm_handlers);
+
+    if (migration_incoming_get_current()->have_listen_thread) {
+        /* Listen thread still going, can't clean up yet */
+        return ret;
+    }
 
     if (ret == 0) {
         cpu_synchronize_all_post_init();
