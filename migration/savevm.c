@@ -1013,6 +1013,13 @@ static SaveStateEntry *find_se(const char *idstr, int instance_id)
     return NULL;
 }
 
+enum LoadVMExitCodes {
+    /* Allow a command to quit all layers of nested loadvm loops */
+    LOADVM_QUIT     =  1,
+};
+
+static int qemu_loadvm_state_main(QEMUFile *f, MigrationIncomingState *mis);
+
 static int loadvm_process_command_simple_lencheck(const char *name,
                                                   unsigned int actual,
                                                   unsigned int expected)
@@ -1028,7 +1035,9 @@ static int loadvm_process_command_simple_lencheck(const char *name,
 
 /*
  * Process an incoming 'QEMU_VM_COMMAND'
- * negative return on error (will issue error message)
+ * 0           just a normal return
+ * LOADVM_QUIT All good, but exit the loop
+ * <0          Error
  */
 static int loadvm_process_command(QEMUFile *f)
 {
@@ -1099,36 +1108,12 @@ void loadvm_free_handlers(MigrationIncomingState *mis)
     }
 }
 
-int qemu_loadvm_state(QEMUFile *f)
+static int qemu_loadvm_state_main(QEMUFile *f, MigrationIncomingState *mis)
 {
-    MigrationIncomingState *mis = migration_incoming_get_current();
-    Error *local_err = NULL;
     uint8_t section_type;
-    unsigned int v;
     int ret;
-    int file_error_after_eof = -1;
 
-    if (qemu_savevm_state_blocked(&local_err)) {
-        error_report_err(local_err);
-        return -EINVAL;
-    }
-
-    v = qemu_get_be32(f);
-    if (v != QEMU_VM_FILE_MAGIC) {
-        error_report("Not a migration stream");
-        return -EINVAL;
-    }
-
-    v = qemu_get_be32(f);
-    if (v == QEMU_VM_FILE_VERSION_COMPAT) {
-        error_report("SaveVM v2 format is obsolete and don't work anymore");
-        return -ENOTSUP;
-    }
-    if (v != QEMU_VM_FILE_VERSION) {
-        error_report("Unsupported migration stream version");
-        return -ENOTSUP;
-    }
-
+    trace_qemu_loadvm_state_main();
     while ((section_type = qemu_get_byte(f)) != QEMU_VM_EOF) {
         uint32_t instance_id, version_id, section_id;
         SaveStateEntry *se;
@@ -1156,16 +1141,14 @@ int qemu_loadvm_state(QEMUFile *f)
             if (se == NULL) {
                 error_report("Unknown savevm section or instance '%s' %d",
                              idstr, instance_id);
-                ret = -EINVAL;
-                goto out;
+                return -EINVAL;
             }
 
             /* Validate version */
             if (version_id > se->version_id) {
                 error_report("savevm: unsupported version %d for '%s' v%d",
                              version_id, idstr, se->version_id);
-                ret = -EINVAL;
-                goto out;
+                return -EINVAL;
             }
 
             /* Add entry */
@@ -1180,11 +1163,10 @@ int qemu_loadvm_state(QEMUFile *f)
             if (ret < 0) {
                 error_report("error while loading state for instance 0x%x of"
                              " device '%s'", instance_id, idstr);
-                goto out;
+                return ret;
             }
             if (!check_section_footer(f, le->se)) {
-                ret = -EINVAL;
-                goto out;
+                return -EINVAL;
             }
             break;
         case QEMU_VM_SECTION_PART:
@@ -1199,58 +1181,87 @@ int qemu_loadvm_state(QEMUFile *f)
             }
             if (le == NULL) {
                 error_report("Unknown savevm section %d", section_id);
-                ret = -EINVAL;
-                goto out;
+                return -EINVAL;
             }
 
             ret = vmstate_load(f, le->se, le->version_id);
             if (ret < 0) {
                 error_report("error while loading state section id %d(%s)",
                              section_id, le->se->idstr);
-                goto out;
+                return ret;
             }
             if (!check_section_footer(f, le->se)) {
-                ret = -EINVAL;
-                goto out;
+                return -EINVAL;
             }
             break;
         case QEMU_VM_COMMAND:
             ret = loadvm_process_command(f);
-            if (ret < 0) {
-                goto out;
+            trace_qemu_loadvm_state_section_command(ret);
+            if ((ret < 0) || (ret & LOADVM_QUIT)) {
+                return ret;
             }
             break;
         default:
             error_report("Unknown savevm section type %d", section_type);
-            ret = -EINVAL;
-            goto out;
+            return -EINVAL;
         }
     }
 
-    file_error_after_eof = qemu_file_get_error(f);
+    return 0;
+}
 
-    /*
-     * Try to read in the VMDESC section as well, so that dumping tools that
-     * intercept our migration stream have the chance to see it.
-     */
-    if (qemu_get_byte(f) == QEMU_VM_VMDESCRIPTION) {
-        uint32_t size = qemu_get_be32(f);
-        uint8_t *buf = g_malloc(0x1000);
+int qemu_loadvm_state(QEMUFile *f)
+{
+    MigrationIncomingState *mis = migration_incoming_get_current();
+    Error *local_err = NULL;
+    unsigned int v;
+    int ret;
 
-        while (size > 0) {
-            uint32_t read_chunk = MIN(size, 0x1000);
-            qemu_get_buffer(f, buf, read_chunk);
-            size -= read_chunk;
-        }
-        g_free(buf);
+    if (qemu_savevm_state_blocked(&local_err)) {
+        error_report_err(local_err);
+        return -EINVAL;
     }
 
-    cpu_synchronize_all_post_init();
+    v = qemu_get_be32(f);
+    if (v != QEMU_VM_FILE_MAGIC) {
+        error_report("Not a migration stream");
+        return -EINVAL;
+    }
 
-    ret = 0;
+    v = qemu_get_be32(f);
+    if (v == QEMU_VM_FILE_VERSION_COMPAT) {
+        error_report("SaveVM v2 format is obsolete and don't work anymore");
+        return -ENOTSUP;
+    }
+    if (v != QEMU_VM_FILE_VERSION) {
+        error_report("Unsupported migration stream version");
+        return -ENOTSUP;
+    }
 
-out:
+    ret = qemu_loadvm_state_main(f, mis);
+    qemu_event_set(&mis->main_thread_load_event);
+
+    trace_qemu_loadvm_state_post_main(ret);
     if (ret == 0) {
+        int file_error_after_eof = qemu_file_get_error(f);
+
+        /*
+         * Try to read in the VMDESC section as well, so that dumping tools that
+         * intercept our migration stream have the chance to see it.
+         */
+        if (qemu_get_byte(f) == QEMU_VM_VMDESCRIPTION) {
+            uint32_t size = qemu_get_be32(f);
+            uint8_t *buf = g_malloc(0x1000);
+
+            while (size > 0) {
+                uint32_t read_chunk = MIN(size, 0x1000);
+                qemu_get_buffer(f, buf, read_chunk);
+                size -= read_chunk;
+            }
+            g_free(buf);
+        }
+
+        cpu_synchronize_all_post_init();
         /* We may not have a VMDESC section, so ignore relative errors */
         ret = file_error_after_eof;
     }
