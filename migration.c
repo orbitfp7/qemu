@@ -26,6 +26,8 @@
 #include "qemu/thread.h"
 #include "qmp-commands.h"
 #include "trace.h"
+#include "exec/memory.h"
+#include "exec/address-spaces.h"
 
 //#define DEBUG_MIGRATION
 
@@ -497,6 +499,15 @@ static void migrate_fd_cleanup(void *opaque)
 
     migrate_fd_cleanup_src_rp(s);
 
+    /* This queue generally should be empty - but in the case of a failed
+     * migration might have some droppings in.
+     */
+    struct MigrationSrcPageRequest *mspr, *next_mspr;
+    QSIMPLEQ_FOREACH_SAFE(mspr, &s->src_page_requests, next_req, next_mspr) {
+        QSIMPLEQ_REMOVE_HEAD(&s->src_page_requests, next_req);
+        g_free(mspr);
+    }
+
     if (s->file) {
         trace_migrate_fd_cleanup();
         qemu_mutex_unlock_iothread();
@@ -602,6 +613,9 @@ MigrationState *migrate_init(const MigrationParams *params)
     s->bandwidth_limit = bandwidth_limit;
     s->state = MIG_STATE_SETUP;
     trace_migrate_set_state(MIG_STATE_SETUP);
+
+    qemu_mutex_init(&s->src_page_req_mutex);
+    QSIMPLEQ_INIT(&s->src_page_requests);
 
     s->total_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     return s;
@@ -816,7 +830,25 @@ static void source_return_path_bad(MigrationState *s)
 static void migrate_handle_rp_reqpages(MigrationState *ms, const char* rbname,
                                        ram_addr_t start, ram_addr_t len)
 {
-    DPRINTF("migrate_handle_rp_reqpages: at %zx for len %zx", start, len);
+    DPRINTF("migrate_handle_rp_reqpages: in %s start %zx len %zx",
+            rbname, start, len);
+
+    /* Round everything up to our host page size */
+    long our_host_ps = sysconf(_SC_PAGESIZE);
+    if (start & (our_host_ps-1)) {
+        long roundings = start & (our_host_ps-1);
+        start -= roundings;
+        len += roundings;
+    }
+    if (len & (our_host_ps-1)) {
+        long roundings = len & (our_host_ps-1);
+        len -= roundings;
+        len += our_host_ps;
+    }
+
+    if (ram_save_queue_pages(ms, rbname, start, len)) {
+        source_return_path_bad(ms);
+    }
 }
 
 /*
