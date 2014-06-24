@@ -120,6 +120,9 @@ struct MigrationState
     /* Flag set once the migration has been asked to enter postcopy */
     bool start_postcopy;
 
+    /* Flag set once the migration thread is running (and needs joining) */
+    bool started_migration_thread;
+
     /* bitmap of pages that have been sent at least once
      * only maintained and used in postcopy at the moment
      * where it's used to send the dirtymap at the start
