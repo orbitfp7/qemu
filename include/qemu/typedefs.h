@@ -8,6 +8,7 @@ typedef struct QEMUTimerListGroup QEMUTimerListGroup;
 typedef struct QEMUFile QEMUFile;
 typedef struct QEMUBH QEMUBH;
 
+typedef struct AdapterInfo AdapterInfo;
 typedef struct AioContext AioContext;
 
 typedef struct Visitor Visitor;
@@ -79,6 +80,6 @@ typedef struct FWCfgState FWCfgState;
 typedef struct PcGuestInfo PcGuestInfo;
 typedef struct PostcopyPMI PostcopyPMI;
 typedef struct Range Range;
-typedef struct AdapterInfo AdapterInfo;
+typedef struct RAMBlock RAMBlock;
 
 #endif /* QEMU_TYPEDEFS_H */

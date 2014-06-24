@@ -658,6 +658,58 @@ static int ram_save_page(QEMUFile *f, RAMBlock* block, ram_addr_t offset,
 }
 
 /*
+ * Queue the pages for transmission, e.g. a request from postcopy destination
+ *   ms: MigrationStatus in which the queue is held
+ *   rbname: The RAMBlock the request is for - may be NULL (to mean reuse last)
+ *   start: Offset from the start of the RAMBlock
+ *   len: Length (in bytes) to send
+ *   Return: 0 on success
+ */
+int ram_save_queue_pages(MigrationState *ms, const char *rbname,
+                         ram_addr_t start, ram_addr_t len)
+{
+    RAMBlock *ramblock;
+
+    if (!rbname) {
+        /* Reuse last RAMBlock */
+        ramblock = ms->last_req_rb;
+
+        if (!ramblock) {
+            error_report("ram_save_queue_pages no previous block");
+            return -1;
+        }
+    } else {
+        ramblock = ram_find_block(rbname);
+
+        if (!ramblock) {
+            error_report("ram_save_queue_pages no block '%s'", rbname);
+            return -1;
+        }
+    }
+    DPRINTF("ram_save_queue_pages: Block %s start %zx len %zx",
+                    ramblock->idstr, start, len);
+
+    if (start+len > ramblock->length) {
+        error_report("%s request overrun start=%zx len=%zx blocklen=%zx",
+                     __func__, start, len, ramblock->length);
+        return -1;
+    }
+
+    struct MigrationSrcPageRequest *new_entry =
+        g_malloc0(sizeof(struct MigrationSrcPageRequest));
+    new_entry->rb = ramblock;
+    new_entry->offset = start;
+    new_entry->len = len;
+    ms->last_req_rb = ramblock;
+
+    qemu_mutex_lock(&ms->src_page_req_mutex);
+    QSIMPLEQ_INSERT_TAIL(&ms->src_page_requests, new_entry, next_req);
+    qemu_mutex_unlock(&ms->src_page_req_mutex);
+
+    return 0;
+}
+
+/*
  * ram_find_and_save_block: Finds a page to send and sends it to f
  *
  * Returns:  The number of bytes written.
