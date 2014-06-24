@@ -265,8 +265,6 @@ CPUArchState *cpu_copy(CPUArchState *env);
 
 /* memory API */
 
-typedef struct RAMBlock RAMBlock;
-
 struct RAMBlock {
     struct MemoryRegion *mr;
     uint8_t *host;
