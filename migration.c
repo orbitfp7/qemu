@@ -1058,6 +1058,12 @@ static int postcopy_start(MigrationState *ms)
      */
     QEMUFile *fb = qemu_bufopen("w", NULL);
 
+    /*
+     * Make sure the receiver can get incoming pages before we send the rest
+     * of the state
+     */
+    qemu_savevm_send_postcopy_ram_listen(fb);
+
     qemu_savevm_state_complete(fb);
     DPRINTF("postcopy_start: sending req 3\n");
     qemu_savevm_send_reqack(fb, 3);
