@@ -21,6 +21,7 @@
 #include "sysemu/sysemu.h"
 #include "block/block.h"
 #include "qapi/qmp/qerror.h"
+#include "qapi/util.h"
 #include "qemu/sockets.h"
 #include "qemu/rcu.h"
 #include "migration/block.h"
@@ -28,8 +29,9 @@
 #include "qemu/thread.h"
 #include "qmp-commands.h"
 #include "trace.h"
-#include "qapi/util.h"
 #include "qapi-event.h"
+#include "exec/memory.h"
+#include "exec/address-spaces.h"
 
 #define MAX_THROTTLE  (32 << 20)      /* Migration speed throttling */
 
@@ -68,6 +70,7 @@ static PostcopyState incoming_postcopy_state;
 /* For outgoing */
 MigrationState *migrate_get_current(void)
 {
+    static bool once;
     static MigrationState current_migration = {
         .state = MIGRATION_STATUS_NONE,
         .bandwidth_limit = MAX_THROTTLE,
@@ -81,6 +84,10 @@ MigrationState *migrate_get_current(void)
                 DEFAULT_MIGRATE_DECOMPRESS_THREAD_COUNT,
     };
 
+    if (!once) {
+        qemu_mutex_init(&current_migration.src_page_req_mutex);
+        once = true;
+    }
     return &current_migration;
 }
 
@@ -718,6 +725,8 @@ static void migrate_fd_cleanup(void *opaque)
     qemu_bh_delete(s->cleanup_bh);
     s->cleanup_bh = NULL;
 
+    flush_page_queue(s);
+
     if (s->file) {
         trace_migrate_fd_cleanup();
         qemu_mutex_unlock_iothread();
@@ -844,6 +853,8 @@ MigrationState *migrate_init(const MigrationParams *params)
                decompress_thread_count;
     s->bandwidth_limit = bandwidth_limit;
     migrate_set_state(s, MIGRATION_STATUS_NONE, MIGRATION_STATUS_SETUP);
+
+    QSIMPLEQ_INIT(&s->src_page_requests);
 
     s->total_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     return s;
@@ -1134,7 +1145,25 @@ static struct rp_cmd_args {
 static void migrate_handle_rp_req_pages(MigrationState *ms, const char* rbname,
                                        ram_addr_t start, size_t len)
 {
+    long our_host_ps = getpagesize();
+
     trace_migrate_handle_rp_req_pages(rbname, start, len);
+
+    /*
+     * Since we currently insist on matching page sizes, just sanity check
+     * we're being asked for whole host pages.
+     */
+    if (start & (our_host_ps-1) ||
+       (len & (our_host_ps-1))) {
+        error_report("%s: Misaligned page request, start: " RAM_ADDR_FMT
+                     " len: " RAM_ADDR_FMT, __func__, start, len);
+        mark_source_rp_bad(ms);
+        return;
+    }
+
+    if (ram_save_queue_pages(ms, rbname, start, len)) {
+        mark_source_rp_bad(ms);
+    }
 }
 
 /*
