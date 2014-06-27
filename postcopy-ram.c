@@ -54,6 +54,8 @@
  *                       areas without creating loads of VMAs.
  */
 
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 
@@ -380,7 +382,31 @@ int postcopy_ram_incoming_init(MigrationIncomingState *mis, size_t ram_pages)
  */
 int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
 {
-    /* TODO: Join the fault thread once we're sure it will exit */
+    DPRINTF("%s: entry", __func__);
+    if (mis->have_fault_thread) {
+        uint64_t tmp64;
+        /*
+         * Tell the fault_thread to exit, it's an eventfd that should
+         * currently be at 0, we're going to inc it to 1
+         */
+        tmp64 = 1;
+        if (write(mis->userfault_quit_fd, &tmp64, 8) == 8) {
+            DPRINTF("%s: Joining fault thread", __func__);
+            qemu_thread_join(&mis->fault_thread);
+        } else {
+            /* Not much we can do here, but may as well report it */
+            perror("incing userfault_quit_fd");
+        }
+
+        DPRINTF("%s: closing uf", __func__);
+        close(mis->userfault_fd);
+        close(mis->userfault_quit_fd);
+        mis->have_fault_thread = false;
+    }
+
+    mis->postcopy_ram_state = POSTCOPY_RAM_INCOMING_END;
+    migrate_send_rp_shut(mis, qemu_file_get_error(mis->file) != 0);
+
     if (qemu_ram_foreach_block(cleanup_area, mis)) {
         return -1;
     }
@@ -389,6 +415,7 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
         munmap(mis->postcopy_tmp_page, getpagesize());
         mis->postcopy_tmp_page = NULL;
     }
+    DPRINTF("%s: exit", __func__);
     return 0;
 }
 
@@ -413,34 +440,204 @@ static int postcopy_ram_sensitise_area(const char *block_name, void *host_addr,
 }
 
 /*
+ * Tell the kernel that we've now got some memory it previously asked for.
+ * Note: We're not allowed to ack a page which wasn't requested.
+ */
+static int ack_userfault(MigrationIncomingState *mis, void *start, size_t len)
+{
+    uint64_t tmp[2];
+
+    /* Kernel wants the range that's now safe to access */
+    tmp[0] = (uint64_t)start;
+    tmp[1] = (uint64_t)start + (uint64_t)(len-1);
+
+    if (write(mis->userfault_fd, tmp, 16) != 16) {
+        int e = errno;
+
+        if (e == ENOENT) {
+            /* Kernel said it wasn't waiting - one case where this can
+             * happen is where two threads triggered the userfault
+             * and we receive the page and ack it just after we received
+             * the 2nd request and that ends up deciding it should ack it
+             * We could optimise it out, but it's rare.
+             */
+            /*fprintf(stderr, "ack_userfault: %p/%zx ENOENT\n", start, len); */
+            return 0;
+        }
+        error_report("postcopy_ram: Failed to notify kernel for %p/%zx (%d)",
+                     start, len, e);
+        return -errno;
+    }
+
+    return 0;
+}
+
+/*
  * Handle faults detected by the USERFAULT markings
  */
 static void *postcopy_ram_fault_thread(void *opaque)
 {
     MigrationIncomingState *mis = (MigrationIncomingState *)opaque;
+    void *hostaddr;
+    int ret;
+    size_t hostpagesize = getpagesize();
+    RAMBlock *rb = NULL;
+    RAMBlock *last_rb = NULL;
 
-    fprintf(stderr, "postcopy_ram_fault_thread\n");
-    /* TODO: In later patch */
+    DPRINTF("%s", __func__);
     qemu_sem_post(&mis->fault_thread_sem);
-    while (1) {
-        /* TODO: In later patch */
-    }
+    while (true) {
+        PostcopyPMIState old_state, tmp_state;
+        ram_addr_t rb_offset;
+        ram_addr_t in_raspace;
+        unsigned long bitmap_index;
+        struct pollfd pfd[2];
 
+        /*
+         * We're mainly waiting for the kernel to give us a faulting HVA,
+         * however we can be told to quit via userfault_quit_fd which is
+         * an eventfd
+         */
+        pfd[0].fd = mis->userfault_fd;
+        pfd[0].events = POLLIN;
+        pfd[0].revents = 0;
+        pfd[1].fd = mis->userfault_quit_fd;
+        pfd[1].events = POLLIN; /* Waiting for eventfd to go positive */
+        pfd[1].revents = 0;
+
+        if (poll(pfd, 2, -1 /* Wait forever */) == -1) {
+            perror("userfault poll");
+            break;
+        }
+
+        if (pfd[1].revents) {
+            DPRINTF("%s got quit event", __func__);
+            break;
+        }
+
+        ret = read(mis->userfault_fd, &hostaddr, sizeof(hostaddr));
+        if (ret != sizeof(hostaddr)) {
+            if (ret < 0) {
+                perror("Failed to read full userfault hostaddr");
+                break;
+            } else {
+                error_report("%s: Read %d bytes from userfaultfd expected %ld",
+                             __func__, ret, sizeof(hostaddr));
+                break; /* Lost alignment, don't know what we'd read next */
+            }
+        }
+
+        /* TODO: We want to be marking host-page-size areas of the bitmaps? */
+        last_rb = rb;
+        rb = qemu_ram_block_from_host(hostaddr, true, &in_raspace, &rb_offset,
+                                      &bitmap_index);
+        if (!rb) {
+            error_report("postcopy_ram_fault_thread: Fault outside guest: %p",
+                         hostaddr);
+            break;
+        }
+
+        DPRINTF("%s: Request for HVA=%p index=%lx rb=%s offset=%zx",
+                __func__, hostaddr, bitmap_index, qemu_ram_get_idstr(rb),
+                rb_offset);
+
+        tmp_state = postcopy_pmi_get_state(mis, bitmap_index);
+        do {
+            old_state = tmp_state;
+
+            switch (old_state) {
+            case POSTCOPY_PMI_REQUESTED:
+                /* Do nothing - it's already requested */
+                break;
+
+            case POSTCOPY_PMI_RECEIVED:
+                /* Already arrived - no state change, just kick the kernel */
+                DPRINTF("postcopy_ram_fault_thread: notify pre of %p",
+                        hostaddr);
+                if (ack_userfault(mis, hostaddr, hostpagesize)) {
+                    assert(0);
+                }
+                break;
+
+            case POSTCOPY_PMI_MISSING:
+
+                tmp_state = postcopy_pmi_change_state(mis, bitmap_index,
+                                           old_state, POSTCOPY_PMI_REQUESTED);
+                if (tmp_state == POSTCOPY_PMI_MISSING) {
+                    /*
+                     * Send the request to the source - we want to request one
+                     * of our host page sizes (which is >= TPS)
+                     */
+                    if (rb != last_rb) {
+                        migrate_send_rp_reqpages(mis, qemu_ram_get_idstr(rb),
+                                                 rb_offset, hostpagesize);
+                    } else {
+                        /* Save some space */
+                        migrate_send_rp_reqpages(mis, NULL,
+                                                 rb_offset, hostpagesize);
+                    }
+                }
+                break;
+           }
+        } while (tmp_state != old_state);
+    }
+    DPRINTF("%s: exit", __func__);
     return NULL;
 }
 
 int postcopy_ram_enable_notify(MigrationIncomingState *mis)
 {
-    /* Create the fault handler thread and wait for it to be ready */
+    uint64_t tmp64;
+
+    /* Open the fd for the kernel to give us userfaults */
+    mis->userfault_fd = syscall(__NR_userfaultfd, O_CLOEXEC);
+    if (mis->userfault_fd == -1) {
+        perror("Failed to open userfault fd");
+        return -1;
+    }
+
+    /*
+     * Version handshake, we send it the version we want and expect to get the
+     * same back.
+     */
+    tmp64 = USERFAULTFD_PROTOCOL;
+    if (write(mis->userfault_fd, &tmp64, sizeof(tmp64)) != sizeof(tmp64)) {
+        perror("Writing userfaultfd version");
+        close(mis->userfault_fd);
+        return -1;
+    }
+    if (read(mis->userfault_fd, &tmp64, sizeof(tmp64)) != sizeof(tmp64)) {
+        perror("Reading userfaultfd version");
+        close(mis->userfault_fd);
+        return -1;
+    }
+    if (tmp64 != USERFAULTFD_PROTOCOL) {
+        error_report("Mismatched userfaultfd version, expected %zx, got %zx",
+                     (size_t)USERFAULTFD_PROTOCOL, (size_t)tmp64);
+        close(mis->userfault_fd);
+        return -1;
+    }
+
+    /* Now an eventfd we use to tell the fault-thread to quit */
+    mis->userfault_quit_fd = eventfd(0, EFD_CLOEXEC);
+    if (mis->userfault_quit_fd == -1) {
+        perror("Opening userfault_quit_fd");
+        close(mis->userfault_fd);
+        return -1;
+    }
+
     qemu_sem_init(&mis->fault_thread_sem, 0);
     qemu_thread_create(&mis->fault_thread, "postcopy/fault",
                        postcopy_ram_fault_thread, mis, QEMU_THREAD_JOINABLE);
     qemu_sem_wait(&mis->fault_thread_sem);
+    mis->have_fault_thread = true;
 
     /* Mark so that we get notified of accesses to unwritten areas */
     if (qemu_ram_foreach_block(postcopy_ram_sensitise_area, NULL)) {
         return -1;
     }
+
+    DPRINTF("postcopy_ram_enable_notify: Sensitised");
 
     return 0;
 }
@@ -475,11 +672,12 @@ int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
 
     if (syscall(__NR_remap_anon_pages, host, from, getpagesize(), 0) !=
             getpagesize()) {
+        int e = errno;
         perror("remap_anon_pages in postcopy_place_page");
         fprintf(stderr, "host: %p from: %p pmi=%d\n", host, from,
                 postcopy_pmi_get_state(mis, bitmap_offset));
 
-        return -errno;
+        return -e;
     }
 
     tmp_state = postcopy_pmi_get_state(mis, bitmap_offset);
@@ -492,7 +690,10 @@ int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
 
 
     if (old_state == POSTCOPY_PMI_REQUESTED) {
-        /* TODO: Notify kernel */
+        /* Send the kernel the host address that should now be accessible */
+        DPRINTF("%s: Notifying kernel bitmap_offset=0x%lx host=%p",
+                __func__, bitmap_offset, host);
+        return ack_userfault(mis, host, getpagesize());
     }
 
     /* TODO: hostpagesize!=targetpagesize case */
