@@ -1498,6 +1498,18 @@ postcopy_discard_send_finish(const char *ramblock, int nwords, int ncmds) "%s ma
 postcopy_cleanup_area(const char *ramblock, void *host_addr, size_t offset, size_t length) "%s: %p offset=%zx length=%zx"
 postcopy_init_area(const char *ramblock, void *host_addr, size_t offset, size_t length) "%s: %p offset=%zx length=%zx"
 postcopy_place_page(unsigned long offset, void *host_addr, bool all_zero, int old_state) "offset=%lx host=%p all_zero=%d old_state=%d"
+postcopy_ram_enable_notify(void) ""
+postcopy_ram_fault_thread_entry(void) ""
+postcopy_ram_fault_thread_exit(void) ""
+postcopy_ram_fault_thread_quit(void) ""
+postcopy_ram_fault_thread_request(uint64_t hostaddr, unsigned long index, const char *ramblock, size_t offset) "Request for HVA=%" PRIx64 " index=%lx rb=%s offset=%zx"
+postcopy_ram_fault_thread_notify_pre(uint64_t hostaddr) "%" PRIx64
+postcopy_ram_fault_thread_notify_zero(void *hostaddr) "%p"
+postcopy_ram_fault_thread_notify_zero_ack(void *hostaddr, unsigned long bitmap_index) "%p %lx"
+postcopy_ram_incoming_cleanup_closeuf(void) ""
+postcopy_ram_incoming_cleanup_entry(void) ""
+postcopy_ram_incoming_cleanup_exit(void) ""
+postcopy_ram_incoming_cleanup_join(void) ""
 
 # kvm-all.c
 kvm_ioctl(int type, void *arg) "type 0x%x, arg %p"
