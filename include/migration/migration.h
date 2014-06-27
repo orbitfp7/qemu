@@ -75,11 +75,15 @@ struct MigrationIncomingState {
      */
     QemuEvent      main_thread_load_event;
 
+    bool           have_fault_thread;
     QemuThread     fault_thread;
     QemuSemaphore  fault_thread_sem;
 
     /* For the kernel to send us notifications */
     int            userfault_fd;
+    /* To tell the fault_thread to quit */
+    int            userfault_quit_fd;
+
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
     void          *postcopy_tmp_page;
