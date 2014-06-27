@@ -1246,6 +1246,11 @@ static RAMBlock *find_ram_block(ram_addr_t addr)
     return NULL;
 }
 
+const char *qemu_ram_get_idstr(RAMBlock *rb)
+{
+    return rb->idstr;
+}
+
 void qemu_ram_set_idstr(ram_addr_t addr, const char *name, DeviceState *dev)
 {
     RAMBlock *new_block = find_ram_block(addr);
@@ -1603,16 +1608,35 @@ static void *qemu_ram_ptr_length(ram_addr_t addr, hwaddr *size)
     }
 }
 
-/* Some of the softmmu routines need to translate from a host pointer
-   (typically a TLB entry) back to a ram offset.  */
-MemoryRegion *qemu_ram_addr_from_host(void *ptr, ram_addr_t *ram_addr)
+/*
+ * Translates a host ptr back to a RAMBlock, a ram_addr and an offset
+ * in that RAMBlock.
+ *
+ * ptr: Host pointer to look up
+ * round_offset: If true round the result offset down to a page boundary
+ * *ram_addr: set to result ram_addr
+ * *offset: set to result offset within the RAMBlock
+ * *bm_index: bitmap index (i.e. scaled ram_addr for use where the scale
+ *                          isn't available)
+ *
+ * Returns: RAMBlock (or NULL if not found)
+ */
+RAMBlock *qemu_ram_block_from_host(void *ptr, bool round_offset,
+                                   ram_addr_t *ram_addr,
+                                   ram_addr_t *offset,
+                                   unsigned long *bm_index)
 {
     RAMBlock *block;
     uint8_t *host = ptr;
 
     if (xen_enabled()) {
         *ram_addr = xen_ram_addr_from_mapcache(ptr);
-        return qemu_get_ram_block(*ram_addr)->mr;
+        block = qemu_get_ram_block(*ram_addr);
+        if (!block) {
+            return NULL;
+        }
+        *offset = (host - block->host);
+        return block;
     }
 
     block = ram_list.mru_block;
@@ -1633,7 +1657,29 @@ MemoryRegion *qemu_ram_addr_from_host(void *ptr, ram_addr_t *ram_addr)
     return NULL;
 
 found:
-    *ram_addr = block->offset + (host - block->host);
+    *offset = (host - block->host);
+    if (round_offset) {
+        *offset &= TARGET_PAGE_MASK;
+    }
+    *ram_addr = block->offset + *offset;
+    *bm_index = *ram_addr >> TARGET_PAGE_BITS;
+    return block;
+}
+
+/* Some of the softmmu routines need to translate from a host pointer
+   (typically a TLB entry) back to a ram offset.  */
+MemoryRegion *qemu_ram_addr_from_host(void *ptr, ram_addr_t *ram_addr)
+{
+    RAMBlock *block;
+    ram_addr_t offset; /* Not used */
+    unsigned long index; /* Not used */
+
+    block = qemu_ram_block_from_host(ptr, false, ram_addr, &offset, &index);
+
+    if (!block) {
+        return NULL;
+    }
+
     return block->mr;
 }
 
