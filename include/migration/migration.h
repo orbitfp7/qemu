@@ -86,6 +86,12 @@ struct MigrationIncomingState {
 
     PostcopyState postcopy_state;
 
+    /*
+     * Free at the start of the main state load, set as the main thread finishes
+     * loading state.
+     */
+    QemuEvent      main_thread_load_event;
+
     bool           have_fault_thread;
     QemuThread     fault_thread;
     QemuSemaphore  fault_thread_sem;

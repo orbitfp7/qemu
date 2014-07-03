@@ -1396,11 +1396,33 @@ static int loadvm_postcopy_handle_listen(MigrationIncomingState *mis)
 static int loadvm_postcopy_handle_run(MigrationIncomingState *mis)
 {
     PostcopyState ps = postcopy_state_set(mis, POSTCOPY_INCOMING_RUNNING);
+    Error *local_err = NULL;
+
     trace_loadvm_postcopy_handle_run();
     if (ps != POSTCOPY_INCOMING_LISTENING) {
         error_report("CMD_POSTCOPY_RUN in wrong postcopy state (%d)", ps);
         return -1;
     }
+
+    /* TODO we should move all of this lot into postcopy_ram.c or a shared code
+     * in migration.c
+     */
+    cpu_synchronize_all_post_init();
+
+    qemu_announce_self();
+
+    /* Make sure all file formats flush their mutable metadata */
+    bdrv_invalidate_cache_all(&local_err);
+    if (local_err) {
+        qerror_report_err(local_err);
+        error_free(local_err);
+        return -1;
+    }
+
+    trace_loadvm_postcopy_handle_run_cpu_sync();
+    cpu_synchronize_all_post_init();
+
+    trace_loadvm_postcopy_handle_run_vmstart();
 
     if (autostart) {
         /* Hold onto your hats, starting the CPU */
@@ -1410,19 +1432,40 @@ static int loadvm_postcopy_handle_run(MigrationIncomingState *mis)
         runstate_set(RUN_STATE_PAUSED);
     }
 
-    return 0;
+    return LOADVM_QUIT_LOOP;
 }
 
-/* The end - with a byte from the source which can tell us to fail. */
-static int loadvm_postcopy_handle_end(MigrationIncomingState *mis)
+/* The end - with a byte from the source which can tell us to fail.
+ * The source sends this either if there is a failure, or if it believes it's
+ * sent everything
+ */
+static int loadvm_postcopy_handle_end(MigrationIncomingState *mis,
+                                          uint8_t status)
 {
     PostcopyState ps = postcopy_state_get(mis);
-    trace_loadvm_postcopy_handle_end();
+    trace_loadvm_postcopy_handle_end(status);
     if (ps == POSTCOPY_INCOMING_NONE) {
         error_report("CMD_POSTCOPY_END in wrong postcopy state (%d)", ps);
         return -1;
     }
-    return -1; /* TODO - expecting 1 byte good/fail */
+
+    if (!status) {
+        /*
+         * This looks good, but it's possible that the device loading in the
+         * main thread hasn't finished yet, and so we might not be in 'RUN'
+         * state yet; wait for the end of the main thread.
+         */
+        qemu_event_wait(&mis->main_thread_load_event);
+    }
+
+    if (status) {
+        error_report("CMD_POSTCOPY_END: error on source host (%d)",
+                     status);
+        qemu_file_set_error(mis->file, -EPIPE);
+    }
+
+    /* This will cause the listen thread to exit and call cleanup */
+    return LOADVM_QUIT_LOOP;
 }
 
 static int loadvm_process_command_simple_lencheck(const char *name,
@@ -1566,7 +1609,7 @@ static int loadvm_process_command(QEMUFile *f)
                                                    len, 1)) {
             return -1;
         }
-        return loadvm_postcopy_handle_end(mis);
+        return loadvm_postcopy_handle_end(mis, qemu_get_byte(f));
 
     case MIG_CMD_POSTCOPY_RAM_DISCARD:
         return loadvm_postcopy_ram_handle_discard(mis, len);
@@ -1730,6 +1773,7 @@ int qemu_loadvm_state(QEMUFile *f)
     }
 
     ret = qemu_loadvm_state_main(f, mis);
+    qemu_event_set(&mis->main_thread_load_event);
 
     trace_qemu_loadvm_state_post_main(ret);
     if (mis->have_listen_thread) {
