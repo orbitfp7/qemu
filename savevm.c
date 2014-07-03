@@ -1373,6 +1373,8 @@ static int loadvm_postcopy_ram_handle_listen(MigrationIncomingState *mis)
 /* After all discards we can start running and asking for pages */
 static int loadvm_postcopy_ram_handle_run(MigrationIncomingState *mis)
 {
+    Error *local_err = NULL;
+
     DPRINTF("%s", __func__);
     if (mis->postcopy_ram_state != POSTCOPY_RAM_INCOMING_LISTENING) {
         error_report("CMD_POSTCOPY_RAM_RUN in wrong postcopy state (%d)",
@@ -1381,6 +1383,28 @@ static int loadvm_postcopy_ram_handle_run(MigrationIncomingState *mis)
     }
 
     mis->postcopy_ram_state = POSTCOPY_RAM_INCOMING_RUNNING;
+
+    /* TODO we should move all of this lot into postcopy_ram.c or a shared code
+     * in migration.c
+     */
+    cpu_synchronize_all_post_init();
+
+    qemu_announce_self();
+    bdrv_clear_incoming_migration_all();
+
+    /* Make sure all file formats flush their mutable metadata */
+    bdrv_invalidate_cache_all(&local_err);
+    if (local_err) {
+        qerror_report_err(local_err);
+        error_free(local_err);
+        return -1;
+    }
+
+    DPRINTF("loadvm_postcopy_ram_handle_run: cpu_synchronize_all_post_init");
+    cpu_synchronize_all_post_init();
+
+    DPRINTF("loadvm_postcopy_ram_handle_run: vm_start");
+
     if (autostart) {
         /* Hold onto your hats, starting the CPU */
         vm_start();
@@ -1389,11 +1413,15 @@ static int loadvm_postcopy_ram_handle_run(MigrationIncomingState *mis)
         runstate_set(RUN_STATE_PAUSED);
     }
 
-    return 0;
+    return LOADVM_EXITCODE_QUITLOOP;
 }
 
-/* The end - with a byte from the source which can tell us to fail. */
-static int loadvm_postcopy_ram_handle_end(MigrationIncomingState *mis)
+/* The end - with a byte from the source which can tell us to fail.
+ * The source sends this either if there is a failure, or if it believes it's
+ * sent everything
+ */
+static int loadvm_postcopy_ram_handle_end(MigrationIncomingState *mis,
+                                          uint8_t status)
 {
     DPRINTF("%s", __func__);
     if (mis->postcopy_ram_state == POSTCOPY_RAM_INCOMING_NONE) {
@@ -1401,7 +1429,32 @@ static int loadvm_postcopy_ram_handle_end(MigrationIncomingState *mis)
                      mis->postcopy_ram_state);
         return -1;
     }
-    return -1; /* TODO - expecting 1 byte good/fail */
+
+    DPRINTF("loadvm_postcopy_ram_handle_end status=%d", status);
+
+    if (!status) {
+        bool one_message = false;
+        /* This looks good, but it's possible that the device loading in the
+         * main thread hasn't finished yet, and so we might not be in 'RUN'
+         * state yet.
+         * TODO: Using an atomic_xchg or something for this
+         */
+        while (mis->postcopy_ram_state == POSTCOPY_RAM_INCOMING_LISTENING) {
+            if (!one_message) {
+                DPRINTF("%s: Waiting for RUN", __func__);
+                one_message = true;
+            }
+        }
+    }
+
+    if (status) {
+        error_report("CMD_POSTCOPY_RAM_END: error on source host (%d)",
+                     status);
+        qemu_file_set_error(mis->file, -EPIPE);
+    }
+
+    /* This will cause the listen thread to exit and call cleanup */
+    return LOADVM_EXITCODE_QUITLOOP;
 }
 
 static int loadvm_process_command_simple_lencheck(const char *name,
@@ -1548,7 +1601,7 @@ static int loadvm_process_command(QEMUFile *f,
                                                    len, 1)) {
             return -1;
         }
-        return loadvm_postcopy_ram_handle_end(mis);
+        return loadvm_postcopy_ram_handle_end(mis, qemu_get_byte(f));
 
     default:
         error_report("VM_COMMAND 0x%x unknown (len 0x%x)", com, len);
