@@ -719,6 +719,8 @@ int qemu_savevm_state_iterate(QEMUFile *f)
         trace_savevm_section_end(se->idstr, se->section_id);
 
         if (ret < 0) {
+            DPRINTF("%s: setting error state after iterate on id=%d/%s",
+                    __func__, se->section_id, se->idstr);
             qemu_file_set_error(f, ret);
         }
         if (ret <= 0) {
@@ -1019,6 +1021,7 @@ int qemu_loadvm_state(QEMUFile *f)
         SaveStateEntry *se;
         char idstr[256];
 
+        DPRINTF("qemu_loadvm_state loop: section_type=%d", section_type);
         switch (section_type) {
         case QEMU_VM_SECTION_START:
         case QEMU_VM_SECTION_FULL:
@@ -1031,6 +1034,9 @@ int qemu_loadvm_state(QEMUFile *f)
             }
             instance_id = qemu_get_be32(f);
             version_id = qemu_get_be32(f);
+
+            DPRINTF("qemu_loadvm_state loop START/FULL: id=%d(%s)",
+                    section_id, idstr);
 
             /* Find savevm section */
             se = find_se(idstr, instance_id);
@@ -1059,8 +1065,9 @@ int qemu_loadvm_state(QEMUFile *f)
 
             ret = vmstate_load(f, le->se, le->version_id);
             if (ret < 0) {
-                fprintf(stderr, "qemu: warning: error while loading state for instance 0x%x of device '%s'\n",
-                        instance_id, idstr);
+                error_report("qemu: error while loading state for"
+                             "instance 0x%x of device '%s'",
+                             instance_id, idstr);
                 goto out;
             }
             break;
@@ -1068,23 +1075,25 @@ int qemu_loadvm_state(QEMUFile *f)
         case QEMU_VM_SECTION_END:
             section_id = qemu_get_be32(f);
 
+            DPRINTF("QEMU_VM_SECTION_PART/END entry for id=%d", section_id);
             QLIST_FOREACH(le, &loadvm_handlers, entry) {
                 if (le->section_id == section_id) {
                     break;
                 }
             }
             if (le == NULL) {
-                fprintf(stderr, "Unknown savevm section %d\n", section_id);
+                error_report("Unknown savevm section %d", section_id);
                 ret = -EINVAL;
                 goto out;
             }
 
             ret = vmstate_load(f, le->se, le->version_id);
             if (ret < 0) {
-                fprintf(stderr, "qemu: warning: error while loading state section id %d\n",
-                        section_id);
+                error_report("qemu: error while loading state section"
+                             " id %d (%s)", section_id, le->se->idstr);
                 goto out;
             }
+            DPRINTF("QEMU_VM_SECTION_PART/END done for id=%d", section_id);
             break;
         case QEMU_VM_COMMAND:
             ret = loadvm_process_command(f);
@@ -1093,11 +1102,12 @@ int qemu_loadvm_state(QEMUFile *f)
             }
             break;
         default:
-            fprintf(stderr, "Unknown savevm section type %d\n", section_type);
+            error_report("Unknown savevm section type %d", section_type);
             ret = -EINVAL;
             goto out;
         }
     }
+    DPRINTF("qemu_loadvm_state loop: exited loop");
 
     cpu_synchronize_all_post_init();
 
@@ -1113,6 +1123,7 @@ out:
         ret = qemu_file_get_error(f);
     }
 
+    DPRINTF("qemu_loadvm_state out: ret=%d", ret);
     return ret;
 }
 
