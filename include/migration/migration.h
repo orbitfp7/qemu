@@ -47,6 +47,14 @@ enum mig_rpcomm_cmd {
     MIG_RPCOMM_ACK,          /* data (seq: be32 ) */
     MIG_RPCOMM_AFTERLASTVALID
 };
+
+/* Source side RP state */
+struct MigrationRetPathState {
+    uint32_t      latest_ack;
+    QemuThread    rp_thread;
+    bool          error;
+};
+
 typedef struct MigrationState MigrationState;
 
 /* State for the incoming migration */
@@ -69,9 +77,11 @@ struct MigrationState
     QemuThread thread;
     QEMUBH *cleanup_bh;
     QEMUFile *file;
+    QEMUFile *return_path;
 
     int state;
     MigrationParams params;
+    struct MigrationRetPathState rp_state;
     double mbps;
     int64_t total_time;
     int64_t downtime;
