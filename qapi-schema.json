@@ -541,6 +541,14 @@
 { 'command': 'query-migrate-capabilities', 'returns':   ['MigrationCapabilityStatus']}
 
 ##
+# @migrate-start-postcopy
+#
+# Switch migration to postcopy mode
+#
+# Since: 2.2
+{ 'command': 'migrate-start-postcopy' }
+
+##
 # @MouseInfo:
 #
 # Information about a mouse device.
