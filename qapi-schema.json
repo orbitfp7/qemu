@@ -670,6 +670,14 @@
             '*tls-port': 'int', '*cert-subject': 'str' } }
 
 ##
+# @migrate-start-postcopy
+#
+# Switch migration to postcopy mode
+#
+# Since: 2.4
+{ 'command': 'migrate-start-postcopy' }
+
+##
 # @MouseInfo:
 #
 # Information about a mouse device.
