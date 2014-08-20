@@ -1398,7 +1398,10 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
 static int ram_save_complete(QEMUFile *f, void *opaque)
 {
     qemu_mutex_lock_ramlist();
-    migration_bitmap_sync();
+
+    if (!migration_postcopy_phase(migrate_get_current())) {
+        migration_bitmap_sync();
+    }
 
     ram_control_before_iterate(f, RAM_CONTROL_FINISH);
 
@@ -1433,7 +1436,8 @@ static void ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size,
 
     remaining_size = ram_save_remaining() * TARGET_PAGE_SIZE;
 
-    if (remaining_size < max_size) {
+    if (!migration_postcopy_phase(migrate_get_current()) &&
+        remaining_size < max_size) {
         qemu_mutex_lock_iothread();
         migration_bitmap_sync();
         qemu_mutex_unlock_iothread();
