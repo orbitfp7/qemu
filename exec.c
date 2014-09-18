@@ -2881,4 +2881,14 @@ int qemu_ram_foreach_block(RAMBlockIterFunc func, void *opaque)
     }
     return 0;
 }
+
+/*
+ * Allows code that needs to deal with migration bitmaps etc to still be built
+ * target independent.
+ */
+size_t qemu_target_page_bits(void)
+{
+    return TARGET_PAGE_BITS;
+}
+
 #endif
