@@ -1024,7 +1024,6 @@ static uint32_t get_32bits_map(unsigned long *map, int64_t start)
  * A helper to put 32 bits into a bit map; trivial for HOST_LONG_BITS=32
  * messier for 64; the bitmaps are actually long's that are 32 or 64bit
  */
-__attribute__ (( unused )) /* Until later in patch series */
 static void put_32bits_map(unsigned long *map, int64_t start,
                            uint32_t v)
 {
@@ -1153,14 +1152,125 @@ static int pc_each_ram_discard(MigrationState *ms)
 }
 
 /*
+ * Utility for the outgoing postcopy code.
+ *
+ * Discard any partially sent host-page size chunks, mark any partially
+ * dirty host-page size chunks as all dirty.
+ *
+ * Returns: 0 on success
+ */
+static int postcopy_chunk_hostpages(MigrationState *ms)
+{
+    struct RAMBlock *block;
+    unsigned int host_bits = sysconf(_SC_PAGESIZE) / TARGET_PAGE_SIZE;
+    uint32_t host_mask;
+
+    /* Should be a power of 2 */
+    assert(host_bits && !(host_bits & (host_bits - 1)));
+    /*
+     * If the host_bits isn't a division of 32 (the minimum long size)
+     * then the code gets a lot more complex; disallow for now
+     * (I'm not aware of a system where it's true anyway)
+     */
+    assert((32 % host_bits) == 0);
+
+    /* A mask, starting at bit 0, containing host_bits continuous set bits */
+    host_mask =  (1u << host_bits) - 1;
+
+
+    if (host_bits == 1) {
+        /* Easy case - TPS==HPS - nothing to be done */
+        return 0;
+    }
+
+    QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+        unsigned long first32, last32, cur32;
+        unsigned long first = block->offset >> TARGET_PAGE_BITS;
+        unsigned long last = (block->offset + (block->length-1))
+                                >> TARGET_PAGE_BITS;
+        PostcopyDiscardState *pds = postcopy_discard_send_init(ms,
+                                                               first & 31,
+                                                               block->idstr);
+
+        first32 = first / 32;
+        last32 = last / 32;
+        for (cur32 = first32; cur32 <= last32; cur32++) {
+            unsigned int current_hp;
+            /* Deal with start/end not on alignment */
+            uint32_t mask = make_32bit_mask(first, last, cur32);
+
+            /* a chunk of sent pages */
+            uint32_t sdata = get_32bits_map(ms->sentmap, cur32 * 32);
+            /* a chunk of dirty pages */
+            uint32_t ddata = get_32bits_map(migration_bitmap, cur32 * 32);
+            uint32_t discard = 0;
+            uint32_t redirty = 0;
+            sdata &= mask;
+            ddata &= mask;
+
+            for (current_hp = 0; current_hp < 32; current_hp += host_bits) {
+                uint32_t host_sent = (sdata >> current_hp) & host_mask;
+                uint32_t host_dirty = (ddata >> current_hp) & host_mask;
+
+                if (host_sent && (host_sent != host_mask)) {
+                    /* Partially sent host page */
+                    redirty |= host_mask << current_hp;
+                    discard |= host_mask << current_hp;
+
+                } else if (host_dirty && (host_dirty != host_mask)) {
+                    /* Partially dirty host page */
+                    redirty |= host_mask << current_hp;
+                }
+            }
+            if (discard) {
+                /* Tell the destination to discard these pages */
+                postcopy_discard_send_chunk(ms, pds, (cur32-first32) * 32,
+                                            discard);
+                /* And clear them in the sent data structure */
+                sdata = get_32bits_map(ms->sentmap, cur32 * 32);
+                put_32bits_map(ms->sentmap, cur32 * 32, sdata & ~discard);
+            }
+            if (redirty) {
+                /*
+                 * Reread original dirty bits and OR in ones we clear; we
+                 * must reread since we might be at the start or end of
+                 * a RAMBlock that the original 'mask' discarded some
+                 * bits from
+                */
+                ddata = get_32bits_map(migration_bitmap, cur32 * 32);
+                put_32bits_map(migration_bitmap, cur32 * 32,
+                           ddata | redirty);
+                /* Inc the count of dirty pages */
+                migration_dirty_pages += ctpop32(redirty - (ddata & redirty));
+            }
+        }
+
+        postcopy_discard_send_finish(ms, pds);
+    }
+    /* Easiest way to make sure we don't resume in the middle of a host-page */
+    last_seen_block = NULL;
+    last_sent_block = NULL;
+
+    return 0;
+}
+
+/*
  * Transmit the set of pages to be discarded after precopy to the target
  * these are pages that have been sent previously but have been dirtied
  * Hopefully this is pretty sparse
  */
 int ram_postcopy_send_discard_bitmap(MigrationState *ms)
 {
+    int ret;
+
     /* This should be our last sync, the src is now paused */
     migration_bitmap_sync();
+
+    /* Deal with TPS != HPS */
+    ret = postcopy_chunk_hostpages(ms);
+    if (ret) {
+        return ret;
+    }
 
     /*
      * Update the sentmap to be  sentmap&=dirty
