@@ -1396,6 +1396,265 @@ static int postcopy_each_ram_send_discard(MigrationState *ms)
 }
 
 /*
+ * Helper for postcopy_chunk_hostpages where HPS/TPS >= bits-in-long
+ *
+ * !! Untested !!
+ */
+static int hostpage_big_chunk_helper(const char *block_name, void *host_addr,
+                                     ram_addr_t offset, ram_addr_t length,
+                                     void *opaque)
+{
+    MigrationState *ms = opaque;
+    unsigned long long_bits = sizeof(long) * 8;
+    unsigned int host_len = (qemu_host_page_size / TARGET_PAGE_SIZE) /
+                            long_bits;
+    unsigned long first_long, last_long, cur_long, current_hp;
+    unsigned long first = offset >> TARGET_PAGE_BITS;
+    unsigned long last = (offset + (length - 1)) >> TARGET_PAGE_BITS;
+
+    PostcopyDiscardState *pds = postcopy_discard_send_init(ms,
+                                                           first,
+                                                           block_name);
+    first_long = first / long_bits;
+    last_long = last / long_bits;
+
+    /*
+     * I'm assuming RAMBlocks must start at the start of host pages,
+     * but I guess they might not use the whole of the host page
+     */
+
+    /* Work along one host page at a time */
+    for (current_hp = first_long; current_hp <= last_long;
+         current_hp += host_len) {
+        bool discard = 0;
+        bool redirty = 0;
+        bool has_some_dirty = false;
+        bool has_some_undirty = false;
+        bool has_some_sent = false;
+        bool has_some_unsent = false;
+
+        /*
+         * Check each long of mask for this hp, and see if anything
+         * needs updating.
+         */
+        for (cur_long = current_hp; cur_long < (current_hp + host_len);
+             cur_long++) {
+            /* a chunk of sent pages */
+            unsigned long sdata = ms->sentmap[cur_long];
+            /* a chunk of dirty pages */
+            unsigned long ddata = migration_bitmap[cur_long];
+
+            if (sdata) {
+                has_some_sent = true;
+            }
+            if (sdata != ~0ul) {
+                has_some_unsent = true;
+            }
+            if (ddata) {
+                has_some_dirty = true;
+            }
+            if (ddata != ~0ul) {
+                has_some_undirty = true;
+            }
+
+        }
+
+        if (has_some_sent && has_some_unsent) {
+            /* Partially sent host page */
+            discard = true;
+            redirty = true;
+        }
+
+        if (has_some_dirty && has_some_undirty) {
+            /* Partially dirty host page */
+            redirty = true;
+        }
+
+        if (!discard && !redirty) {
+            /* All consistent - next host page */
+            continue;
+        }
+
+
+        /* Now walk the chunks again, sending discards etc */
+        for (cur_long = current_hp; cur_long < (current_hp + host_len);
+             cur_long++) {
+            unsigned long cur_bits = cur_long * long_bits;
+
+            /* a chunk of sent pages */
+            unsigned long sdata = ms->sentmap[cur_long];
+            /* a chunk of dirty pages */
+            unsigned long ddata = migration_bitmap[cur_long];
+
+            if (discard && sdata) {
+                /* Tell the destination to discard these pages */
+                postcopy_discard_send_range(ms, pds, cur_bits,
+                                            cur_bits + long_bits - 1);
+                /* And clear them in the sent data structure */
+                ms->sentmap[cur_long] = 0;
+            }
+
+            if (redirty) {
+                migration_bitmap[cur_long] = ~0ul;
+                /* Inc the count of dirty pages */
+                migration_dirty_pages += ctpopl(~ddata);
+            }
+        }
+    }
+
+    postcopy_discard_send_finish(ms, pds);
+
+    return 0;
+}
+
+/*
+ * When working on long chunks of a bitmap where the only valid section
+ * is between start..end (inclusive), generate a mask with only those
+ * valid bits set for the current long word within that bitmask.
+ */
+static unsigned long make_long_mask(unsigned long start, unsigned long end,
+                                    unsigned long cur_long)
+{
+    unsigned long long_bits = sizeof(long) * 8;
+    unsigned long long_bits_mask = long_bits - 1;
+    unsigned long first_long, last_long;
+    unsigned long mask = ~(unsigned long)0;
+    first_long = start / long_bits ;
+    last_long = end / long_bits;
+
+    if ((cur_long == first_long) && (start & long_bits_mask)) {
+        /* e.g. (start & 31) = 3
+         *         1 << .    -> 2^3
+         *         . - 1     -> 2^3 - 1 i.e. mask 2..0
+         *         ~.        -> mask 31..3
+         */
+        mask &= ~((((unsigned long)1) << (start & long_bits_mask)) - 1);
+    }
+
+    if ((cur_long == last_long) && ((end & long_bits_mask) != long_bits_mask)) {
+        /* e.g. (end & 31) = 3
+         *            .   +1 -> 4
+         *         1 << .    -> 2^4
+         *         . -1      -> 2^4 - 1
+         *                   = mask set 3..0
+         */
+        mask &= (((unsigned long)1) << ((end & long_bits_mask) + 1)) - 1;
+    }
+
+    return mask;
+}
+
+/*
+ * Utility for the outgoing postcopy code.
+ *
+ * Discard any partially sent host-page size chunks, mark any partially
+ * dirty host-page size chunks as all dirty.
+ *
+ * Returns: 0 on success
+ */
+static int postcopy_chunk_hostpages(MigrationState *ms)
+{
+    struct RAMBlock *block;
+    unsigned int host_bits = qemu_host_page_size / TARGET_PAGE_SIZE;
+    unsigned long long_bits = sizeof(long) * 8;
+    unsigned long host_mask;
+
+    assert(is_power_of_2(host_bits));
+
+    if (qemu_host_page_size == TARGET_PAGE_SIZE) {
+        /* Easy case - TPS==HPS - nothing to be done */
+        return 0;
+    }
+
+    /* Easiest way to make sure we don't resume in the middle of a host-page */
+    last_seen_block = NULL;
+    last_sent_block = NULL;
+
+    /*
+     * The currently worst known ratio is ARM that has 1kB target pages, and
+     * can have 64kB host pages, which is thus inconveniently larger than a long
+     * on ARM (32bits), and a long is the underlying element of the migration
+     * bitmaps.
+     */
+    if (host_bits >= long_bits) {
+        /* Deal with the odd case separately */
+        return qemu_ram_foreach_block(hostpage_big_chunk_helper, ms);
+    } else {
+        host_mask =  (1ul << host_bits) - 1;
+    }
+
+    rcu_read_lock();
+    QLIST_FOREACH_RCU(block, &ram_list.blocks, next) {
+        unsigned long first_long, last_long, cur_long;
+        unsigned long first = block->offset >> TARGET_PAGE_BITS;
+        unsigned long last = (block->offset + (block->used_length - 1))
+                                >> TARGET_PAGE_BITS;
+        PostcopyDiscardState *pds = postcopy_discard_send_init(ms,
+                                                               first,
+                                                               block->idstr);
+
+        first_long = first / long_bits;
+        last_long = last / long_bits;
+        for (cur_long = first_long; cur_long <= last_long; cur_long++) {
+            unsigned long current_hp;
+            /* Deal with start/end not on alignment */
+            unsigned long mask = make_long_mask(first, last, cur_long);
+
+            /* a chunk of sent pages */
+            unsigned long sdata = ms->sentmap[cur_long];
+            /* a chunk of dirty pages */
+            unsigned long ddata = migration_bitmap[cur_long];
+            unsigned long discard = 0;
+            unsigned long redirty = 0;
+            sdata &= mask;
+            ddata &= mask;
+
+            for (current_hp = 0; current_hp < long_bits;
+                 current_hp += host_bits) {
+                unsigned long host_sent = (sdata >> current_hp) & host_mask;
+                unsigned long host_dirty = (ddata >> current_hp) & host_mask;
+
+                if (host_sent && (host_sent != host_mask)) {
+                    /* Partially sent host page */
+                    redirty |= host_mask << current_hp;
+                    discard |= host_mask << current_hp;
+
+                    /* Tell the destination to discard this page */
+                    postcopy_discard_send_range(ms, pds,
+                             cur_long * long_bits + current_hp /* start */,
+                             cur_long * long_bits + current_hp +
+                                 host_bits - 1 /* end */);
+                } else if (host_dirty && (host_dirty != host_mask)) {
+                    /* Partially dirty host page */
+                    redirty |= host_mask << current_hp;
+                }
+            }
+            if (discard) {
+                /* clear the page in the sentmap */
+                ms->sentmap[cur_long] &= ~discard;
+            }
+            if (redirty) {
+                /*
+                 * Reread original dirty bits and OR in ones we clear; we
+                 * must reread since we might be at the start or end of
+                 * a RAMBlock that the original 'mask' discarded some
+                 * bits from
+                */
+                ddata = migration_bitmap[cur_long];
+                migration_bitmap[cur_long] = ddata | redirty;
+                /* Inc the count of dirty pages */
+                migration_dirty_pages += ctpopl(redirty - (ddata & redirty));
+            }
+        }
+
+        postcopy_discard_send_finish(ms, pds);
+    }
+
+    rcu_read_unlock();
+    return 0;
+}
+
+/*
  * Transmit the set of pages to be discarded after precopy to the target
  * these are pages that have been sent previously but have been dirtied
  * Hopefully this is pretty sparse
@@ -1405,8 +1664,16 @@ int ram_postcopy_send_discard_bitmap(MigrationState *ms)
     int ret;
 
     rcu_read_lock();
+
     /* This should be our last sync, the src is now paused */
     migration_bitmap_sync();
+
+    /* Deal with TPS != HPS */
+    ret = postcopy_chunk_hostpages(ms);
+    if (ret) {
+        rcu_read_unlock();
+        return ret;
+    }
 
     /*
      * Update the sentmap to be  sentmap&=dirty
