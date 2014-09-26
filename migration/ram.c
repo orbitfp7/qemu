@@ -1508,6 +1508,189 @@ static int postcopy_each_ram_send_discard(MigrationState *ms)
 }
 
 /*
+ * Utility for the outgoing postcopy code.
+ *
+ * Discard any partially sent host-page size chunks, mark any partially
+ * dirty host-page size chunks as all dirty.
+ *
+ * Returns: 0 on success
+ */
+static int postcopy_chunk_hostpages(MigrationState *ms)
+{
+    struct RAMBlock *block;
+    unsigned int host_ratio = qemu_host_page_size / TARGET_PAGE_SIZE;
+
+    if (qemu_host_page_size == TARGET_PAGE_SIZE) {
+        /* Easy case - TPS==HPS - nothing to be done */
+        return 0;
+    }
+
+    /* Easiest way to make sure we don't resume in the middle of a host-page */
+    last_seen_block = NULL;
+    last_sent_block = NULL;
+    last_offset     = 0;
+
+    QLIST_FOREACH_RCU(block, &ram_list.blocks, next) {
+        unsigned long first = block->offset >> TARGET_PAGE_BITS;
+        unsigned long len = block->used_length >> TARGET_PAGE_BITS;
+        unsigned long last = first + (len - 1);
+        unsigned long found_set;
+        unsigned long search_start;
+
+        PostcopyDiscardState *pds =
+                         postcopy_discard_send_init(ms, first, block->idstr);
+
+        /* First pass: Discard all partially sent host pages */
+        found_set = find_next_bit(ms->sentmap, last + 1, first);
+        while (found_set <= last) {
+            bool do_discard = false;
+            unsigned long discard_start_addr;
+            /*
+             * If the start of this run of pages is in the middle of a host
+             * page, then we need to discard this host page.
+             */
+            if (found_set % host_ratio) {
+                do_discard = true;
+                found_set -= found_set % host_ratio;
+                discard_start_addr = found_set;
+                search_start = found_set + host_ratio;
+            } else {
+                /* Find the end of this run */
+                unsigned long found_zero;
+                found_zero = find_next_zero_bit(ms->sentmap, last + 1,
+                                                found_set + 1);
+                /*
+                 * If the 0 isn't at the start of a host page, then the
+                 * run of 1's doesn't finish at the end of a host page
+                 * and we need to discard.
+                 */
+                if (found_zero % host_ratio) {
+                    do_discard = true;
+                    discard_start_addr = found_zero - (found_zero % host_ratio);
+                    /*
+                     * This host page has gone, the next loop iteration starts
+                     * from the next page with a 1 bit
+                     */
+                    search_start = discard_start_addr + host_ratio;
+                } else {
+                    /*
+                     * No discards on this iteration, next loop starts from
+                     * next 1 bit
+                     */
+                    search_start = found_zero + 1;
+                }
+            }
+            /* Find the next 1 for the next iteration */
+            found_set = find_next_bit(ms->sentmap, last + 1, search_start);
+
+            if (do_discard) {
+                unsigned long page;
+
+                /* Tell the destination to discard this page */
+                postcopy_discard_send_range(ms, pds, discard_start_addr,
+                         discard_start_addr + host_ratio - 1);
+                /* Clean up the bitmap */
+                for (page = discard_start_addr;
+                     page < discard_start_addr + host_ratio; page++) {
+                    /* All pages in this host page are now not sent */
+                    clear_bit(page, ms->sentmap);
+
+                    /*
+                     * Remark them as dirty, updating the count for any pages
+                     * that weren't previously dirty.
+                     */
+                    migration_dirty_pages += !test_and_set_bit(page,
+                                                             migration_bitmap);
+                }
+            }
+        }
+
+        /*
+         * Second pass: Ensure that all partially dirty host pages are made
+         * fully dirty.
+         */
+        found_set = find_next_bit(migration_bitmap, last + 1, first);
+        while (found_set <= last) {
+            bool do_dirty = false;
+            unsigned long dirty_start_addr;
+            /*
+             * If the start of this run of pages is in the middle of a host
+             * page, then we need to mark the whole of this host page dirty
+             */
+            if (found_set % host_ratio) {
+                do_dirty = true;
+                found_set -= found_set % host_ratio;
+                dirty_start_addr = found_set;
+                search_start = found_set + host_ratio;
+            } else {
+                /* Find the end of this run */
+                unsigned long found_zero;
+                found_zero = find_next_zero_bit(migration_bitmap, last + 1,
+                                                found_set + 1);
+                /*
+                 * If the 0 isn't at the start of a host page, then the
+                 * run of 1's doesn't finish at the end of a host page
+                 * and we need to discard.
+                 */
+                if (found_zero % host_ratio) {
+                    do_dirty = true;
+                    dirty_start_addr = found_zero - (found_zero % host_ratio);
+                    /*
+                     * This host page has gone, the next loop iteration starts
+                     * from the next page with a 1 bit
+                     */
+                    search_start = dirty_start_addr + host_ratio;
+                } else {
+                    /*
+                     * No discards on this iteration, next loop starts from
+                     * next 1 bit
+                     */
+                    search_start = found_zero + 1;
+                }
+            }
+
+            /* Find the next 1 for the next iteration */
+            found_set = find_next_bit(migration_bitmap, last + 1, search_start);
+
+            if (do_dirty) {
+                unsigned long page;
+
+                if (test_bit(dirty_start_addr, ms->sentmap)) {
+                    /*
+                     * If the page being redirtied is marked as sent, then it
+                     * must have been fully sent (otherwise it would have been
+                     * discarded by the previous pass.)
+                     * Discard it now.
+                     */
+                    postcopy_discard_send_range(ms, pds, dirty_start_addr,
+                                                dirty_start_addr +
+                                                host_ratio - 1);
+                }
+
+                /* Clean up the bitmap */
+                for (page = dirty_start_addr;
+                     page < dirty_start_addr + host_ratio; page++) {
+
+                    /* Clear the sentmap bits for the discard case above */
+                    clear_bit(page, ms->sentmap);
+
+                    /*
+                     * Mark them as dirty, updating the count for any pages
+                     * that weren't previously dirty.
+                     */
+                    migration_dirty_pages += !test_and_set_bit(page,
+                                                             migration_bitmap);
+                }
+            }
+        }
+        postcopy_discard_send_finish(ms, pds);
+
+    } /* ram_list loop */
+
+    return 0;
+}
+
+/*
  * Transmit the set of pages to be discarded after precopy to the target
  * these are pages that:
  *     a) Have been previously transmitted but are now dirty again
@@ -1524,6 +1707,13 @@ int ram_postcopy_send_discard_bitmap(MigrationState *ms)
 
     /* This should be our last sync, the src is now paused */
     migration_bitmap_sync();
+
+    /* Deal with TPS != HPS */
+    ret = postcopy_chunk_hostpages(ms);
+    if (ret) {
+        rcu_read_unlock();
+        return ret;
+    }
 
     /*
      * Update the sentmap to be sentmap = ~sentmap | dirty
