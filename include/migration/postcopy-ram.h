@@ -13,7 +13,19 @@
 #ifndef QEMU_POSTCOPY_RAM_H
 #define QEMU_POSTCOPY_RAM_H
 
+#include "migration/migration.h"
+
 /* Return true if the host supports everything we need to do postcopy-ram */
 bool postcopy_ram_supported_by_host(void);
 
+/*
+ * In 'advise' mode record that a page has been received.
+ */
+void postcopy_hook_early_receive(MigrationIncomingState *mis,
+                                 size_t bitmap_index);
+
+void postcopy_pmi_destroy(MigrationIncomingState *mis);
+void postcopy_pmi_discard_range(MigrationIncomingState *mis,
+                                size_t start, size_t npages);
+void postcopy_pmi_dump(MigrationIncomingState *mis);
 #endif

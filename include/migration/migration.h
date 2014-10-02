@@ -48,6 +48,23 @@ enum mig_rpcomm_cmd {
     MIG_RP_CMD_PONG,         /* Response to a PING; data (seq: be32 ) */
 };
 
+/* Postcopy page-map-incoming - data about each page on the inbound side */
+typedef enum {
+   POSTCOPY_PMI_MISSING    = 0, /* page hasn't yet been received */
+   POSTCOPY_PMI_REQUESTED  = 1, /* Kernel asked for a page, not yet got it */
+   POSTCOPY_PMI_RECEIVED   = 2, /* We've got the page */
+} PostcopyPMIState;
+
+struct PostcopyPMI {
+    QemuMutex      mutex;
+    unsigned long *state0;        /* Together with state1 form a */
+    unsigned long *state1;        /* PostcopyPMIState */
+    unsigned long  host_mask;     /* A mask with enough bits set to cover one
+                                     host page in the PMI */
+    unsigned long  host_bits;     /* The number of bits in the map representing
+                                     one host page */
+};
+
 typedef QLIST_HEAD(, LoadStateEntry) LoadStateEntry_Head;
 
 typedef enum {
@@ -69,6 +86,7 @@ struct MigrationIncomingState {
 
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
+    PostcopyPMI    postcopy_pmi;
 };
 
 MigrationIncomingState *migration_incoming_get_current(void);
