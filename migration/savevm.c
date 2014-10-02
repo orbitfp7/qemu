@@ -1347,7 +1347,6 @@ static int loadvm_postcopy_ram_handle_discard(MigrationIncomingState *mis,
     }
     trace_loadvm_postcopy_ram_handle_discard_header(ramid, len);
     while (len) {
-        /* TODO - ram_discard_range gets added in a later patch
         uint64_t start_addr, block_length;
         start_addr = qemu_get_be64(mis->from_src_file);
         block_length = qemu_get_be64(mis->from_src_file);
@@ -1358,7 +1357,6 @@ static int loadvm_postcopy_ram_handle_discard(MigrationIncomingState *mis,
         if (ret) {
             return ret;
         }
-        */
     }
     trace_loadvm_postcopy_ram_handle_discard_end();
 
