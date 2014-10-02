@@ -28,4 +28,38 @@ void postcopy_pmi_destroy(MigrationIncomingState *mis);
 void postcopy_pmi_discard_range(MigrationIncomingState *mis,
                                 size_t start, size_t npages);
 void postcopy_pmi_dump(MigrationIncomingState *mis);
+
+/*
+ * Discard the contents of memory start..end inclusive.
+ * We can assume that if we've been called postcopy_ram_hosttest returned true
+ */
+int postcopy_ram_discard_range(MigrationIncomingState *mis, uint8_t *start,
+                               uint8_t *end);
+
+
+/*
+ * Called at the start of each RAMBlock by the bitmap code
+ * offset is the bit within the first 32bit chunk of mask
+ * that represents the first page of the RAM Block
+ * Returns a new PDS
+ */
+PostcopyDiscardState *postcopy_discard_send_init(MigrationState *ms,
+                                                 uint8_t offset,
+                                                 const char *name);
+
+/*
+ * Called by the bitmap code for each chunk to discard
+ * May send a discard message, may just leave it queued to
+ * be sent later
+ */
+void postcopy_discard_send_chunk(MigrationState *ms, PostcopyDiscardState *pds,
+                                unsigned long pos, uint32_t bitmap);
+
+/*
+ * Called at the end of each RAMBlock by the bitmap code
+ * Sends any outstanding discard messages, frees the PDS
+ */
+void postcopy_discard_send_finish(MigrationState *ms,
+                                  PostcopyDiscardState *pds);
+
 #endif
