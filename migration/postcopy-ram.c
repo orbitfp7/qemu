@@ -28,6 +28,19 @@
 #include "qemu/error-report.h"
 #include "trace.h"
 
+#define MAX_DISCARDS_PER_COMMAND 12
+
+struct PostcopyDiscardState {
+    const char *name;
+    uint16_t cur_entry;
+    uint64_t addrlist[MAX_DISCARDS_PER_COMMAND];
+    uint32_t masklist[MAX_DISCARDS_PER_COMMAND];
+    uint8_t  offset;  /* Offset within 32bit mask at addr0 representing 1st
+                         page of block */
+    unsigned int nsentwords;
+    unsigned int nsentcmds;
+};
+
 /* Postcopy needs to detect accesses to pages that haven't yet been copied
  * across, and efficiently map new pages in, the techniques for doing this
  * are target OS specific.
@@ -364,6 +377,21 @@ out:
     return ret;
 }
 
+/*
+ * Discard the contents of memory start..end inclusive.
+ * We can assume that if we've been called postcopy_ram_hosttest returned true
+ */
+int postcopy_ram_discard_range(MigrationIncomingState *mis, uint8_t *start,
+                               uint8_t *end)
+{
+    if (madvise(start, (end-start)+1, MADV_DONTNEED)) {
+        perror("postcopy_ram_discard_range MADV_DONTNEED");
+        return -1;
+    }
+
+    return 0;
+}
+
 #else
 /* No target OS support, stubs just fail */
 
@@ -380,5 +408,88 @@ void postcopy_hook_early_receive(MigrationIncomingState *mis,
     /* We don't support postcopy so don't care */
 }
 
+void postcopy_pmi_destroy(MigrationIncomingState *mis)
+{
+    /* Called in normal cleanup path - so it's OK */
+}
+
+void postcopy_pmi_discard_range(MigrationIncomingState *mis,
+                                size_t start, size_t npages)
+{
+    assert(0);
+}
+
+int postcopy_ram_discard_range(MigrationIncomingState *mis, uint8_t *start,
+                               uint8_t *end)
+{
+    assert(0);
+}
 #endif
 
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Called at the start of each RAMBlock by the bitmap code
+ * offset is the bit within the first 64bit chunk of mask
+ * that represents the first page of the RAM Block
+ * Returns a new PDS
+ */
+PostcopyDiscardState *postcopy_discard_send_init(MigrationState *ms,
+                                                 uint8_t offset,
+                                                 const char *name)
+{
+    PostcopyDiscardState *res = g_try_malloc(sizeof(PostcopyDiscardState));
+
+    if (res) {
+        res->name = name;
+        res->cur_entry = 0;
+        res->nsentwords = 0;
+        res->nsentcmds = 0;
+        res->offset = offset;
+    }
+
+    return res;
+}
+
+/*
+ * Called by the bitmap code for each chunk to discard
+ * May send a discard message, may just leave it queued to
+ * be sent later
+ */
+void postcopy_discard_send_chunk(MigrationState *ms, PostcopyDiscardState *pds,
+                                unsigned long pos, uint32_t bitmap)
+{
+    pds->addrlist[pds->cur_entry] = pos;
+    pds->masklist[pds->cur_entry] = bitmap;
+    pds->cur_entry++;
+    pds->nsentwords++;
+
+    if (pds->cur_entry == MAX_DISCARDS_PER_COMMAND) {
+        /* Full set, ship it! */
+        qemu_savevm_send_postcopy_ram_discard(ms->file, pds->name,
+                                              pds->cur_entry, pds->offset,
+                                              pds->addrlist, pds->masklist);
+        pds->nsentcmds++;
+        pds->cur_entry = 0;
+    }
+}
+
+/*
+ * Called at the end of each RAMBlock by the bitmap code
+ * Sends any outstanding discard messages, frees the PDS
+ */
+void postcopy_discard_send_finish(MigrationState *ms, PostcopyDiscardState *pds)
+{
+    /* Anything unsent? */
+    if (pds->cur_entry) {
+        qemu_savevm_send_postcopy_ram_discard(ms->file, pds->name,
+                                              pds->cur_entry, pds->offset,
+                                              pds->addrlist, pds->masklist);
+        pds->nsentcmds++;
+    }
+
+    trace_postcopy_discard_send_finish(pds->name, pds->nsentwords,
+                                       pds->nsentcmds);
+
+    g_free(pds);
+}

@@ -61,6 +61,7 @@ typedef struct PCIExpressHost PCIExpressHost;
 typedef struct PCIHostState PCIHostState;
 typedef struct PCMCIACardState PCMCIACardState;
 typedef struct PixelFormat PixelFormat;
+typedef struct PostcopyDiscardState PostcopyDiscardState;
 typedef struct PostcopyPMI PostcopyPMI;
 typedef struct PropertyInfo PropertyInfo;
 typedef struct Property Property;

@@ -40,6 +40,7 @@
 #include "hw/audio/audio.h"
 #include "sysemu/kvm.h"
 #include "migration/migration.h"
+#include "migration/postcopy-ram.h"
 #include "hw/i386/smbios.h"
 #include "exec/address-spaces.h"
 #include "hw/audio/pcspk.h"
@@ -414,9 +415,17 @@ static int save_xbzrle_page(QEMUFile *f, uint8_t **current_data,
     return bytes_sent;
 }
 
+/* mr: The region to search for dirty pages in
+ * start: Start address (typically so we can continue from previous page)
+ * ram_addr_abs: Pointer into which to store the address of the dirty page
+ *               within the global ram_addr space
+ *
+ * Returns: byte offset within memory region of the start of a dirty page
+ */
 static inline
 ram_addr_t migration_bitmap_find_and_reset_dirty(MemoryRegion *mr,
-                                                 ram_addr_t start)
+                                                 ram_addr_t start,
+                                                 ram_addr_t *ram_addr_abs)
 {
     unsigned long base = mr->ram_addr >> TARGET_PAGE_BITS;
     unsigned long nr = base + (start >> TARGET_PAGE_BITS);
@@ -435,6 +444,7 @@ ram_addr_t migration_bitmap_find_and_reset_dirty(MemoryRegion *mr,
         clear_bit(next, migration_bitmap);
         migration_dirty_pages--;
     }
+    *ram_addr_abs = next << TARGET_PAGE_BITS;
     return (next - base) << TARGET_PAGE_BITS;
 }
 
@@ -571,6 +581,19 @@ static void migration_bitmap_sync(void)
     }
 }
 
+static RAMBlock *ram_find_block(const char *id)
+{
+    RAMBlock *block;
+
+    QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+        if (!strcmp(id, block->idstr)) {
+            return block;
+        }
+    }
+
+    return NULL;
+}
+
 /*
  * ram_save_page: Send the given page to the stream
  *
@@ -659,13 +682,16 @@ static int ram_find_and_save_block(QEMUFile *f, bool last_stage)
     bool complete_round = false;
     int bytes_sent = 0;
     MemoryRegion *mr;
+    ram_addr_t dirty_ram_abs; /* Address of the start of the dirty page in
+                                 ram_addr_t space */
 
     if (!block)
         block = QTAILQ_FIRST(&ram_list.blocks);
 
     while (true) {
         mr = block->mr;
-        offset = migration_bitmap_find_and_reset_dirty(mr, offset);
+        offset = migration_bitmap_find_and_reset_dirty(mr, offset,
+                                                       &dirty_ram_abs);
         if (complete_round && block == last_seen_block &&
             offset >= last_offset) {
             break;
@@ -683,6 +709,11 @@ static int ram_find_and_save_block(QEMUFile *f, bool last_stage)
 
             /* if page is unmodified, continue to the next */
             if (bytes_sent > 0) {
+                MigrationState *ms = migrate_get_current();
+                if (ms->sentmap) {
+                    set_bit(dirty_ram_abs >> TARGET_PAGE_BITS, ms->sentmap);
+                }
+
                 last_sent_block = block;
                 break;
             }
@@ -742,10 +773,17 @@ void free_xbzrle_decoded_buf(void)
 
 static void migration_end(void)
 {
+    MigrationState *s = migrate_get_current();
+
     if (migration_bitmap) {
         memory_global_dirty_log_stop();
         g_free(migration_bitmap);
         migration_bitmap = NULL;
+    }
+
+    if (s->sentmap) {
+        g_free(s->sentmap);
+        s->sentmap = NULL;
     }
 
     XBZRLE_cache_lock();
@@ -815,6 +853,232 @@ void ram_debug_dump_bitmap(unsigned long *todump, bool expected)
     }
 }
 
+/* **** functions for postcopy ***** */
+
+/*
+ * A helper to get 32 bits from a bit map; trivial for HOST_LONG_BITS=32
+ * messier for 64; the bitmaps are actually long's that are 32 or 64bit
+ */
+static uint32_t get_32bits_map(unsigned long *map, int64_t start)
+{
+#if HOST_LONG_BITS == 64
+    uint64_t tmp64;
+
+    tmp64 = map[start / 64];
+    return (start & 32) ? (tmp64 >> 32) : (tmp64 & 0xffffffffu);
+#elif HOST_LONG_BITS == 32
+    /*
+     * Irrespective of host endianness, sentmap[n] is for pages earlier
+     * than sentmap[n+1] so we can't just cast up
+     */
+    return map[start / 32];
+#else
+#error "Host long other than 64/32 not supported"
+#endif
+}
+
+/*
+ * A helper to put 32 bits into a bit map; trivial for HOST_LONG_BITS=32
+ * messier for 64; the bitmaps are actually long's that are 32 or 64bit
+ */
+__attribute__ (( unused )) /* Until later in patch series */
+static void put_32bits_map(unsigned long *map, int64_t start,
+                           uint32_t v)
+{
+#if HOST_LONG_BITS == 64
+    uint64_t tmp64 = v;
+    uint64_t mask = 0xffffffffu;
+
+    if (start & 32) {
+        tmp64 = tmp64 << 32;
+        mask =  mask << 32;
+    }
+
+    map[start / 64] = (map[start / 64] & ~mask) | tmp64;
+#elif HOST_LONG_BITS == 32
+    /*
+     * Irrespective of host endianness, sentmap[n] is for pages earlier
+     * than sentmap[n+1] so we can't just cast up
+     */
+    map[start / 32] = v;
+#else
+#error "Host long other than 64/32 not supported"
+#endif
+}
+
+/*
+ * When working on 32bit chunks of a bitmap where the only valid section
+ * is between start..end (inclusive), generate a mask with only those
+ * valid bits set for the current 32bit word within that bitmask.
+ */
+static int make_32bit_mask(unsigned long start, unsigned long end,
+                           unsigned long cur32)
+{
+    unsigned long first32, last32;
+    uint32_t mask = ~(uint32_t)0;
+    first32 = start / 32;
+    last32 = end / 32;
+
+    if ((cur32 == first32) && (start & 31)) {
+        /* e.g. (start & 31) = 3
+         *         1 << .    -> 2^3
+         *         . - 1     -> 2^3 - 1 i.e. mask 2..0
+         *         ~.        -> mask 31..3
+         */
+        mask &= ~((((uint32_t)1) << (start & 31)) - 1);
+    }
+
+    if ((cur32 == last32) && ((end & 31) != 31)) {
+        /* e.g. (end & 31) = 3
+         *            .   +1 -> 4
+         *         1 << .    -> 2^4
+         *         . -1      -> 2^4 - 1
+         *                   = mask set 3..0
+         */
+        mask &= (((uint32_t)1) << ((end & 31) + 1)) - 1;
+    }
+
+    return mask;
+}
+
+/*
+ * Callback from ram_postcopy_each_ram_discard for each RAMBlock
+ * start,end: Indexes into the bitmap for the first and last bit
+ *            representing the named block
+ */
+static int pc_send_discard_bm_ram(MigrationState *ms,
+                                  PostcopyDiscardState *pds,
+                                  unsigned long start, unsigned long end)
+{
+    /*
+     * There is no guarantee that start, end are on convenient 32bit multiples
+     * (We always send 32bit chunks over the wire, irrespective of long size)
+     */
+    unsigned long first32, last32, cur32;
+    first32 = start / 32;
+    last32 = end / 32;
+
+    for (cur32 = first32; cur32 <= last32; cur32++) {
+        /* Deal with start/end not on alignment */
+        uint32_t mask = make_32bit_mask(start, end, cur32);
+
+        uint32_t data = get_32bits_map(ms->sentmap, cur32 * 32);
+        data &= mask;
+
+        if (data) {
+            postcopy_discard_send_chunk(ms, pds, (cur32-first32) * 32, data);
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Utility for the outgoing postcopy code.
+ *   Calls postcopy_send_discard_bm_ram for each RAMBlock
+ *   passing it bitmap indexes and name.
+ * Returns: 0 on success
+ * (qemu_ram_foreach_block ends up passing unscaled lengths
+ *  which would mean postcopy code would have to deal with target page)
+ */
+static int pc_each_ram_discard(MigrationState *ms)
+{
+    struct RAMBlock *block;
+    int ret;
+
+    QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+        unsigned long first = block->offset >> TARGET_PAGE_BITS;
+        unsigned long last = (block->offset + (block->max_length-1))
+                                >> TARGET_PAGE_BITS;
+        PostcopyDiscardState *pds = postcopy_discard_send_init(ms,
+                                                               first & 31,
+                                                               block->idstr);
+
+        /*
+         * Postcopy sends chunks of bitmap over the wire, but it
+         * just needs indexes at this point, avoids it having
+         * target page specific code.
+         */
+        ret = pc_send_discard_bm_ram(ms, pds, first, last);
+        postcopy_discard_send_finish(ms, pds);
+        if (ret) {
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Transmit the set of pages to be discarded after precopy to the target
+ * these are pages that have been sent previously but have been dirtied
+ * Hopefully this is pretty sparse
+ */
+int ram_postcopy_send_discard_bitmap(MigrationState *ms)
+{
+    /* This should be our last sync, the src is now paused */
+    migration_bitmap_sync();
+
+    /*
+     * Update the sentmap to be  sentmap&=dirty
+     */
+    bitmap_and(ms->sentmap, ms->sentmap, migration_bitmap,
+               last_ram_offset() >> TARGET_PAGE_BITS);
+
+
+    trace_ram_postcopy_send_discard_bitmap();
+#ifdef DEBUG_POSTCOPY
+    ram_debug_dump_bitmap(ms->sentmap, false);
+#endif
+
+    return pc_each_ram_discard(ms);
+}
+
+/*
+ * At the start of the postcopy phase of migration, any now-dirty
+ * precopied pages are discarded.
+ *
+ * start..end is an inclusive range of bits indexed in the source
+ *    VMs bitmap for this RAMBlock, source_target_page_bits tells
+ *    us what one of those bits represents.
+ *
+ * start/end are offsets from the start of the bitmap for RAMBlock 'block_name'
+ *
+ * Returns 0 on success.
+ */
+int ram_discard_range(MigrationIncomingState *mis,
+                      const char *block_name,
+                      uint64_t start, uint64_t end)
+{
+    assert(end >= start);
+
+    RAMBlock *rb = ram_find_block(block_name);
+
+    if (!rb) {
+        error_report("ram_discard_range: Failed to find block '%s'",
+                     block_name);
+        return -1;
+    }
+
+    uint64_t index_offset = rb->offset >> TARGET_PAGE_BITS;
+    postcopy_pmi_discard_range(mis, start + index_offset, (end - start) + 1);
+
+    /* +1 gives the byte after the end of the last page to be discarded */
+    ram_addr_t end_offset = (end+1) << TARGET_PAGE_BITS;
+    uint8_t *host_startaddr = rb->host + (start << TARGET_PAGE_BITS);
+    uint8_t *host_endaddr;
+
+    if (end_offset <= rb->used_length) {
+        host_endaddr   = rb->host + (end_offset-1);
+        return postcopy_ram_discard_range(mis, host_startaddr, host_endaddr);
+    } else {
+        error_report("ram_discard_range: Overrun block '%s' (%" PRIu64
+                     "/%" PRIu64 "/%zu)",
+                     block_name, start, end, rb->used_length);
+        return -1;
+    }
+}
+
 static int ram_save_setup(QEMUFile *f, void *opaque)
 {
     RAMBlock *block;
@@ -854,7 +1118,6 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
 
         acct_clear();
     }
-
     qemu_mutex_lock_iothread();
     qemu_mutex_lock_ramlist();
     bytes_transferred = 0;
@@ -863,6 +1126,12 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
     ram_bitmap_pages = last_ram_offset() >> TARGET_PAGE_BITS;
     migration_bitmap = bitmap_new(ram_bitmap_pages);
     bitmap_set(migration_bitmap, 0, ram_bitmap_pages);
+
+    if (migrate_postcopy_ram()) {
+        MigrationState *s = migrate_get_current();
+        s->sentmap = bitmap_new(ram_bitmap_pages);
+        bitmap_clear(s->sentmap, 0, ram_bitmap_pages);
+    }
 
     /*
      * Count the total number of pages used by ram blocks not including any
