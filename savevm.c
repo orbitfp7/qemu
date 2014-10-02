@@ -1267,15 +1267,12 @@ static int loadvm_postcopy_ram_handle_discard(MigrationIncomingState *mis,
              * we know there must be at least 1 bit set due to the loop entry
              * If there is no 0 firstzero will be 32
              */
-            /* TODO - ram_discard_range gets added in a later patch
             int ret = ram_discard_range(mis, ramid,
                                 startaddr + firstset - first_bit_offset,
                                 startaddr + (firstzero - 1) - first_bit_offset);
-            ret = -1;
             if (ret) {
                 return ret;
             }
-            */
 
             /* mask= .?0000000000 */
             /*         ^fz ^fs    */

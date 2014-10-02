@@ -22,6 +22,7 @@
 #include "block/block.h"
 #include "qemu/sockets.h"
 #include "migration/block.h"
+#include "migration/postcopy-ram.h"
 #include "qemu/thread.h"
 #include "qmp-commands.h"
 #include "trace.h"
@@ -947,6 +948,7 @@ static void *migration_thread(void *opaque)
             } else {
                 int ret;
 
+                DPRINTF("done iterating\n");
                 qemu_mutex_lock_iothread();
                 start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
                 qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
