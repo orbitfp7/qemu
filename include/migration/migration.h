@@ -114,6 +114,13 @@ struct MigrationState
 
     /* Flag set once the migration has been asked to enter postcopy */
     bool start_postcopy;
+
+    /* bitmap of pages that have been sent at least once
+     * only maintained and used in postcopy at the moment
+     * where it's used to send the dirtymap at the start
+     * of the postcopy phase
+     */
+    unsigned long *sentmap;
 };
 
 void process_incoming_migration(QEMUFile *f);
@@ -183,6 +190,11 @@ double xbzrle_mig_cache_miss_rate(void);
 
 void ram_handle_compressed(void *host, uint8_t ch, uint64_t size);
 void ram_debug_dump_bitmap(unsigned long *todump, bool expected);
+/* For outgoing discard bitmap */
+int ram_postcopy_send_discard_bitmap(MigrationState *ms);
+/* For incoming postcopy discard */
+int ram_discard_range(MigrationIncomingState *mis, const char *block_name,
+                      uint64_t start, uint64_t end);
 
 /**
  * @migrate_add_blocker - prevent migration from proceeding

@@ -27,6 +27,22 @@
 #include "qemu/error-report.h"
 #include "trace.h"
 
+#define MAX_DISCARDS_PER_COMMAND 12
+
+struct PostcopyDiscardState {
+    const char *name;
+    uint64_t offset; /* Bitmap entry for the 1st bit of this RAMBlock */
+    uint16_t cur_entry;
+    /*
+     * Start and end address of a discard range; end_list points to the byte
+     * after the end of the range.
+     */
+    uint64_t start_list[MAX_DISCARDS_PER_COMMAND];
+    uint64_t   end_list[MAX_DISCARDS_PER_COMMAND];
+    unsigned int nsentwords;
+    unsigned int nsentcmds;
+};
+
 /* Postcopy needs to detect accesses to pages that haven't yet been copied
  * across, and efficiently map new pages in, the techniques for doing this
  * are target OS specific.
@@ -145,6 +161,22 @@ out:
     return ret;
 }
 
+/*
+ * Discard the contents of memory start..end inclusive.
+ * We can assume that if we've been called postcopy_ram_hosttest returned true
+ */
+int postcopy_ram_discard_range(MigrationIncomingState *mis, uint8_t *start,
+                               uint8_t *end)
+{
+    trace_postcopy_ram_discard_range(start, end);
+    if (madvise(start, (end-start)+1, MADV_DONTNEED)) {
+        error_report("%s MADV_DONTNEED: %s", __func__, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
 #else
 /* No target OS support, stubs just fail */
 
@@ -154,5 +186,81 @@ bool postcopy_ram_supported_by_host(void)
     return false;
 }
 
+int postcopy_ram_discard_range(MigrationIncomingState *mis, uint8_t *start,
+                               uint8_t *end)
+{
+    assert(0);
+}
 #endif
 
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Called at the start of each RAMBlock by the bitmap code
+ * 'offset' is the bitmap offset of the named RAMBlock in the migration
+ * bitmap.
+ * Returns a new PDS
+ */
+PostcopyDiscardState *postcopy_discard_send_init(MigrationState *ms,
+                                                 unsigned long offset,
+                                                 const char *name)
+{
+    PostcopyDiscardState *res = g_try_malloc(sizeof(PostcopyDiscardState));
+
+    if (res) {
+        res->name = name;
+        res->cur_entry = 0;
+        res->nsentwords = 0;
+        res->nsentcmds = 0;
+        res->offset = offset;
+    }
+
+    return res;
+}
+
+/*
+ * Called by the bitmap code for each chunk to discard
+ * May send a discard message, may just leave it queued to
+ * be sent later
+ * 'start' and 'end' describe an inclusive range of pages in the
+ * migration bitmap in the RAM block passed to postcopy_discard_send_init
+ */
+void postcopy_discard_send_range(MigrationState *ms, PostcopyDiscardState *pds,
+                                unsigned long start, unsigned long end)
+{
+    size_t tp_bits = qemu_target_page_bits();
+    /* Convert to byte offsets within the RAM block */
+    pds->start_list[pds->cur_entry] = (start - pds->offset) << tp_bits;
+    pds->end_list[pds->cur_entry] = (1 + end - pds->offset) << tp_bits;
+    pds->cur_entry++;
+    pds->nsentwords++;
+
+    if (pds->cur_entry == MAX_DISCARDS_PER_COMMAND) {
+        /* Full set, ship it! */
+        qemu_savevm_send_postcopy_ram_discard(ms->file, pds->name,
+                                              pds->cur_entry,
+                                              pds->start_list, pds->end_list);
+        pds->nsentcmds++;
+        pds->cur_entry = 0;
+    }
+}
+
+/*
+ * Called at the end of each RAMBlock by the bitmap code
+ * Sends any outstanding discard messages, frees the PDS
+ */
+void postcopy_discard_send_finish(MigrationState *ms, PostcopyDiscardState *pds)
+{
+    /* Anything unsent? */
+    if (pds->cur_entry) {
+        qemu_savevm_send_postcopy_ram_discard(ms->file, pds->name,
+                                              pds->cur_entry,
+                                              pds->start_list, pds->end_list);
+        pds->nsentcmds++;
+    }
+
+    trace_postcopy_discard_send_finish(pds->name, pds->nsentwords,
+                                       pds->nsentcmds);
+
+    g_free(pds);
+}
