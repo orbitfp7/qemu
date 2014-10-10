@@ -40,6 +40,7 @@
 #include "hw/audio/audio.h"
 #include "sysemu/kvm.h"
 #include "migration/migration.h"
+#include "migration/postcopy-ram.h"
 #include "hw/i386/smbios.h"
 #include "exec/address-spaces.h"
 #include "hw/audio/pcspk.h"
@@ -53,9 +54,12 @@
 #include "hw/acpi/acpi.h"
 #include "qemu/host-utils.h"
 
+// #define DEBUG_ARCH_INIT
 #ifdef DEBUG_ARCH_INIT
 #define DPRINTF(fmt, ...) \
-    do { fprintf(stdout, "arch_init: " fmt, ## __VA_ARGS__); } while (0)
+    do { fprintf(stderr,  "arch_init@%" PRId64 " " fmt "\n", \
+                          qemu_clock_get_ms(QEMU_CLOCK_REALTIME), \
+                          ## __VA_ARGS__); } while (0)
 #else
 #define DPRINTF(fmt, ...) \
     do { } while (0)
@@ -327,6 +331,7 @@ static RAMBlock *last_seen_block;
 /* This is the last block from where we have sent data */
 static RAMBlock *last_sent_block;
 static ram_addr_t last_offset;
+static bool last_was_from_queue;
 static unsigned long *migration_bitmap;
 static uint64_t migration_dirty_pages;
 static uint32_t last_version;
@@ -412,9 +417,15 @@ static int save_xbzrle_page(QEMUFile *f, uint8_t **current_data,
     return bytes_sent;
 }
 
+/* mr: The region to search for dirty pages in
+ * start: Start address (typically so we can continue from previous page)
+ * bitoffset: Pointer into which to store the offset into the dirty map
+ *            at which the bit was found.
+ */
 static inline
 ram_addr_t migration_bitmap_find_and_reset_dirty(MemoryRegion *mr,
-                                                 ram_addr_t start)
+                                                 ram_addr_t start,
+                                                 unsigned long *bitoffset)
 {
     unsigned long base = mr->ram_addr >> TARGET_PAGE_BITS;
     unsigned long nr = base + (start >> TARGET_PAGE_BITS);
@@ -431,8 +442,10 @@ ram_addr_t migration_bitmap_find_and_reset_dirty(MemoryRegion *mr,
 
     if (next < size) {
         clear_bit(next, migration_bitmap);
+        assert(migration_dirty_pages > 0);
         migration_dirty_pages--;
     }
+    *bitoffset = next;
     return (next - base) << TARGET_PAGE_BITS;
 }
 
@@ -445,6 +458,19 @@ static inline bool migration_bitmap_set_dirty(ram_addr_t addr)
 
     if (!ret) {
         migration_dirty_pages++;
+    }
+    return ret;
+}
+
+static inline bool migration_bitmap_clear_dirty(ram_addr_t addr)
+{
+    bool ret;
+    int nr = addr >> TARGET_PAGE_BITS;
+
+    ret = test_and_clear_bit(nr, migration_bitmap);
+
+    if (ret) {
+        migration_dirty_pages--;
     }
     return ret;
 }
@@ -561,6 +587,19 @@ static void migration_bitmap_sync(void)
     }
 }
 
+static RAMBlock *ram_find_block(const char *id)
+{
+    RAMBlock *block;
+
+    QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+        if (!strcmp(id, block->idstr)) {
+            return block;
+        }
+    }
+
+    return NULL;
+}
+
 /*
  * ram_save_page: Send the given page to the stream
  *
@@ -636,6 +675,91 @@ static int ram_save_page(QEMUFile *f, RAMBlock* block, ram_addr_t offset,
 }
 
 /*
+ * Unqueue a page from the queue fed by postcopy page requests
+ *
+ * Returns:   The RAMBlock* to transmit from (or NULL if the queue is empty)
+ *      ms:   MigrationState in
+ *  offset:   the byte offset within the RAMBlock for the start of the page
+ * bitoffset: global offset in the dirty/sent bitmaps
+ */
+static RAMBlock *ram_save_unqueue_page(MigrationState *ms, ram_addr_t *offset,
+                                       unsigned long *bitoffset)
+{
+    RAMBlock *result = NULL;
+    qemu_mutex_lock(&ms->src_page_req_mutex);
+    if (!QSIMPLEQ_EMPTY(&ms->src_page_requests)) {
+        struct MigrationSrcPageRequest *entry =
+                                    QSIMPLEQ_FIRST(&ms->src_page_requests);
+        result = entry->rb;
+        *offset = entry->offset;
+        *bitoffset = (entry->offset + entry->rb->offset) >> TARGET_PAGE_BITS;
+
+        if (entry->len > TARGET_PAGE_SIZE) {
+            entry->len -= TARGET_PAGE_SIZE;
+            entry->offset += TARGET_PAGE_SIZE;
+        } else {
+            QSIMPLEQ_REMOVE_HEAD(&ms->src_page_requests, next_req);
+            g_free(entry);
+        }
+    }
+    qemu_mutex_unlock(&ms->src_page_req_mutex);
+
+    return result;
+}
+
+/*
+ * Queue the pages for transmission, e.g. a request from postcopy destination
+ *   ms: MigrationStatus in which the queue is held
+ *   rbname: The RAMBlock the request is for - may be NULL (to mean reuse last)
+ *   start: Offset from the start of the RAMBlock
+ *   len: Length (in bytes) to send
+ *   Return: 0 on success
+ */
+int ram_save_queue_pages(MigrationState *ms, const char *rbname,
+                         ram_addr_t start, ram_addr_t len)
+{
+    RAMBlock *ramblock;
+
+    if (!rbname) {
+        /* Reuse last RAMBlock */
+        ramblock = ms->last_req_rb;
+
+        if (!ramblock) {
+            error_report("ram_save_queue_pages no previous block");
+            return -1;
+        }
+    } else {
+        ramblock = ram_find_block(rbname);
+
+        if (!ramblock) {
+            error_report("ram_save_queue_pages no block '%s'", rbname);
+            return -1;
+        }
+    }
+    DPRINTF("ram_save_queue_pages: Block %s start %zx len %zx",
+                    ramblock->idstr, start, len);
+
+    if (start+len > ramblock->length) {
+        error_report("%s request overrun start=%zx len=%zx blocklen=%zx",
+                     __func__, start, len, ramblock->length);
+        return -1;
+    }
+
+    struct MigrationSrcPageRequest *new_entry =
+        g_malloc0(sizeof(struct MigrationSrcPageRequest));
+    new_entry->rb = ramblock;
+    new_entry->offset = start;
+    new_entry->len = len;
+    ms->last_req_rb = ramblock;
+
+    qemu_mutex_lock(&ms->src_page_req_mutex);
+    QSIMPLEQ_INSERT_TAIL(&ms->src_page_requests, new_entry, next_req);
+    qemu_mutex_unlock(&ms->src_page_req_mutex);
+
+    return 0;
+}
+
+/*
  * ram_find_and_save_block: Finds a page to send and sends it to f
  *
  * Returns:  The number of bytes written.
@@ -644,38 +768,97 @@ static int ram_save_page(QEMUFile *f, RAMBlock* block, ram_addr_t offset,
 
 static int ram_find_and_save_block(QEMUFile *f, bool last_stage)
 {
+    MigrationState *ms = migrate_get_current();
     RAMBlock *block = last_seen_block;
+    RAMBlock *tmpblock;
     ram_addr_t offset = last_offset;
+    ram_addr_t tmpoffset;
     bool complete_round = false;
     int bytes_sent = 0;
-    MemoryRegion *mr;
+    unsigned long bitoffset;
+    unsigned long hps = sysconf(_SC_PAGESIZE);
 
-    if (!block)
+    if (!block) {
         block = QTAILQ_FIRST(&ram_list.blocks);
+        last_was_from_queue = false;
+    }
 
-    while (true) {
-        mr = block->mr;
-        offset = migration_bitmap_find_and_reset_dirty(mr, offset);
-        if (complete_round && block == last_seen_block &&
-            offset >= last_offset) {
-            break;
+    while (true) { /* Until we send a block or run out of stuff to send */
+        tmpblock = NULL;
+
+        /*
+         * Don't break host-page chunks up with queue items
+         * so only unqueue if,
+         *   a) The last item came from the queue anyway
+         *   b) The last sent item was the last target-page in a host page
+         */
+        if (last_was_from_queue || (!last_sent_block) ||
+            ((last_offset & (hps - 1)) == (hps - TARGET_PAGE_SIZE))) {
+            tmpblock = ram_save_unqueue_page(ms, &tmpoffset, &bitoffset);
         }
-        if (offset >= block->length) {
-            offset = 0;
-            block = QTAILQ_NEXT(block, next);
-            if (!block) {
-                block = QTAILQ_FIRST(&ram_list.blocks);
-                complete_round = true;
-                ram_bulk_stage = false;
-            }
-        } else {
-            bytes_sent = ram_save_page(f, block, offset, last_stage);
 
-            /* if page is unmodified, continue to the next */
-            if (bytes_sent > 0) {
-                last_sent_block = block;
+        if (tmpblock) {
+            /* We've got a block from the postcopy queue */
+            DPRINTF("%s: Got postcopy item '%s' offset=%zx bitoffset=%zx",
+                    __func__, tmpblock->idstr, tmpoffset, bitoffset);
+            /* We're sending this page, and since it's postcopy nothing else
+             * will dirty it, and we must make sure it doesn't get sent again.
+             */
+            if (!migration_bitmap_clear_dirty(bitoffset << TARGET_PAGE_BITS)) {
+                DPRINTF("%s: Not dirty for postcopy %s/%zx bito=%zx (sent=%d)",
+                        __func__, tmpblock->idstr, tmpoffset, bitoffset,
+                        test_bit(bitoffset, ms->sentmap));
+                continue;
+            }
+            /*
+             * As soon as we start servicing pages out of order, then we have
+             * to kill the bulk stage, since the bulk stage assumes
+             * in (migration_bitmap_find_and_reset_dirty) that every page is
+             * dirty, that's no longer true.
+             */
+            ram_bulk_stage = false;
+            /*
+             * We mustn't change block/offset unless it's to a valid one
+             * otherwise we can go down some of the exit cases in the normal
+             * path.
+             */
+            block = tmpblock;
+            offset = tmpoffset;
+            last_was_from_queue = true;
+        } else {
+            MemoryRegion *mr;
+            /* priority queue empty, so just search for something dirty */
+            mr = block->mr;
+            offset = migration_bitmap_find_and_reset_dirty(mr, offset,
+                                                           &bitoffset);
+            if (complete_round && block == last_seen_block &&
+                offset >= last_offset) {
                 break;
             }
+            if (offset >= block->length) {
+                offset = 0;
+                block = QTAILQ_NEXT(block, next);
+                if (!block) {
+                    block = QTAILQ_FIRST(&ram_list.blocks);
+                    complete_round = true;
+                    ram_bulk_stage = false;
+                }
+                continue; /* pick an offset in the new block */
+            }
+            last_was_from_queue = false;
+        }
+
+        /* We have a page to send, so send it */
+        bytes_sent = ram_save_page(f, block, offset, last_stage);
+
+        /* if page is unmodified, continue to the next */
+        if (bytes_sent > 0) {
+            if (ms->sentmap) {
+                set_bit(bitoffset, ms->sentmap);
+            }
+
+            last_sent_block = block;
+            break;
         }
     }
     last_seen_block = block;
@@ -732,10 +915,17 @@ void free_xbzrle_decoded_buf(void)
 
 static void migration_end(void)
 {
+    MigrationState *s = migrate_get_current();
+
     if (migration_bitmap) {
         memory_global_dirty_log_stop();
         g_free(migration_bitmap);
         migration_bitmap = NULL;
+    }
+
+    if (s->sentmap) {
+        g_free(s->sentmap);
+        s->sentmap = NULL;
     }
 
     XBZRLE_cache_lock();
@@ -762,9 +952,385 @@ static void reset_ram_globals(void)
     last_offset = 0;
     last_version = ram_list.version;
     ram_bulk_stage = true;
+    last_was_from_queue = false;
 }
 
 #define MAX_WAIT 50 /* ms, half buffered_file limit */
+
+/*
+ * 'expected' is the value you expect the bitmap mostly to be full
+ * of and it won't bother printing lines that are all this value
+ * if 'todump' is null the migration bitmap is dumped.
+ */
+void ram_debug_dump_bitmap(unsigned long *todump, bool expected)
+{
+    int64_t ram_pages = last_ram_offset() >> TARGET_PAGE_BITS;
+
+    int64_t cur;
+    int64_t linelen = 128l;
+    char linebuf[129];
+
+    if (!todump) {
+        todump = migration_bitmap;
+    }
+
+    for (cur = 0; cur < ram_pages; cur += linelen) {
+        int64_t curb;
+        bool found = false;
+        /*
+         * Last line; catch the case where the line length
+         * is longer than remaining ram
+         */
+        if (cur+linelen > ram_pages) {
+            linelen = ram_pages - cur;
+        }
+        for (curb = 0; curb < linelen; curb++) {
+            bool thisbit = test_bit(cur+curb, todump);
+            linebuf[curb] = thisbit ? '1' : '.';
+            found |= (thisbit ^ expected);
+        }
+        if (found) {
+            linebuf[curb] = '\0';
+            fprintf(stderr,  "0x%08" PRIx64 " : %s\n", cur, linebuf);
+        }
+    }
+}
+
+/* **** functions for postcopy ***** */
+
+/*
+ * A helper to get 32 bits from a bit map; trivial for HOST_LONG_BITS=32
+ * messier for 64; the bitmaps are actually long's that are 32 or 64bit
+ */
+static uint32_t get_32bits_map(unsigned long *map, int64_t start)
+{
+#if HOST_LONG_BITS == 64
+    uint64_t tmp64;
+
+    tmp64 = map[start / 64];
+    return (start & 32) ? (tmp64 >> 32) : (tmp64 & 0xffffffffu);
+#elif HOST_LONG_BITS == 32
+    /*
+     * Irrespective of host endianness, sentmap[n] is for pages earlier
+     * than sentmap[n+1] so we can't just cast up
+     */
+    return map[start / 32];
+#else
+#error "Host long other than 64/32 not supported"
+#endif
+}
+
+/*
+ * A helper to put 32 bits into a bit map; trivial for HOST_LONG_BITS=32
+ * messier for 64; the bitmaps are actually long's that are 32 or 64bit
+ */
+static void put_32bits_map(unsigned long *map, int64_t start,
+                           uint32_t v)
+{
+#if HOST_LONG_BITS == 64
+    uint64_t tmp64 = v;
+    uint64_t mask = 0xffffffffu;
+
+    if (start & 32) {
+        tmp64 = tmp64 << 32;
+        mask =  mask << 32;
+    }
+
+    map[start / 64] = (map[start / 64] & ~mask) | tmp64;
+#elif HOST_LONG_BITS == 32
+    /*
+     * Irrespective of host endianness, sentmap[n] is for pages earlier
+     * than sentmap[n+1] so we can't just cast up
+     */
+    map[start / 32] = v;
+#else
+#error "Host long other than 64/32 not supported"
+#endif
+}
+
+/*
+ * When working on 32bit chunks of a bitmap where the only valid section
+ * is between start..end (inclusive), generate a mask with only those
+ * valid bits set for the current 32bit word within that bitmask.
+ */
+static int make_32bit_mask(unsigned long start, unsigned long end,
+                           unsigned long cur32)
+{
+    unsigned long first32, last32;
+    uint32_t mask = ~(uint32_t)0;
+    first32 = start / 32;
+    last32 = end / 32;
+
+    if ((cur32 == first32) && (start & 31)) {
+        /* e.g. (start & 31) = 3
+         *         1 << .    -> 2^3
+         *         . - 1     -> 2^3 - 1 i.e. mask 2..0
+         *         ~.        -> mask 31..3
+         */
+        mask &= ~((((uint32_t)1) << (start & 31)) - 1);
+    }
+
+    if ((cur32 == last32) && ((end & 31) != 31)) {
+        /* e.g. (end & 31) = 3
+         *            .   +1 -> 4
+         *         1 << .    -> 2^4
+         *         . -1      -> 2^4 - 1
+         *                   = mask set 3..0
+         */
+        mask &= (((uint32_t)1) << ((end & 31) + 1)) - 1;
+    }
+
+    return mask;
+}
+
+/*
+ * Callback from ram_postcopy_each_ram_discard for each RAMBlock
+ * start,end: Indexes into the bitmap for the first and last bit
+ *            representing the named block
+ */
+static int pc_send_discard_bm_ram(MigrationState *ms,
+                                  PostcopyDiscardState *pds,
+                                  unsigned long start, unsigned long end)
+{
+    /*
+     * There is no guarantee that start, end are on convenient 32bit multiples
+     * (We always send 32bit chunks over the wire, irrespective of long size)
+     */
+    unsigned long first32, last32, cur32;
+    first32 = start / 32;
+    last32 = end / 32;
+
+    for (cur32 = first32; cur32 <= last32; cur32++) {
+        /* Deal with start/end not on alignment */
+        uint32_t mask = make_32bit_mask(start, end, cur32);
+
+        uint32_t data = get_32bits_map(ms->sentmap, cur32 * 32);
+        data &= mask;
+
+        if (data) {
+            postcopy_discard_send_chunk(ms, pds, (cur32-first32) * 32, data);
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Utility for the outgoing postcopy code.
+ *   Calls postcopy_send_discard_bm_ram for each RAMBlock
+ *   passing it bitmap indexes and name.
+ * Returns: 0 on success
+ * (qemu_ram_foreach_block ends up passing unscaled lengths
+ *  which would mean postcopy code would have to deal with target page)
+ */
+static int pc_each_ram_discard(MigrationState *ms)
+{
+    struct RAMBlock *block;
+    int ret;
+
+    QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+        unsigned long first = block->offset >> TARGET_PAGE_BITS;
+        unsigned long last = (block->offset + (block->length-1))
+                                >> TARGET_PAGE_BITS;
+        PostcopyDiscardState *pds = postcopy_discard_send_init(ms,
+                                                               first & 31,
+                                                               block->idstr);
+
+        /*
+         * Postcopy sends chunks of bitmap over the wire, but it
+         * just needs indexes at this point, avoids it having
+         * target page specific code.
+         */
+        ret = pc_send_discard_bm_ram(ms, pds, first, last);
+        postcopy_discard_send_finish(ms, pds);
+        if (ret) {
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Utility for the outgoing postcopy code.
+ *
+ * Discard any partially sent host-page size chunks, mark any partially
+ * dirty host-page size chunks as all dirty.
+ *
+ * Returns: 0 on success
+ */
+static int postcopy_chunk_hostpages(MigrationState *ms)
+{
+    struct RAMBlock *block;
+    unsigned int host_bits = sysconf(_SC_PAGESIZE) / TARGET_PAGE_SIZE;
+    uint32_t host_mask;
+
+    /* Should be a power of 2 */
+    assert(host_bits && !(host_bits & (host_bits - 1)));
+    /*
+     * If the host_bits isn't a division of 32 (the minimum long size)
+     * then the code gets a lot more complex; disallow for now
+     * (I'm not aware of a system where it's true anyway)
+     */
+    assert((32 % host_bits) == 0);
+
+    /* A mask, starting at bit 0, containing host_bits continuous set bits */
+    host_mask =  (1u << host_bits) - 1;
+
+
+    if (host_bits == 1) {
+        /* Easy case - TPS==HPS - nothing to be done */
+        return 0;
+    }
+
+    QTAILQ_FOREACH(block, &ram_list.blocks, next) {
+        unsigned long first32, last32, cur32;
+        unsigned long first = block->offset >> TARGET_PAGE_BITS;
+        unsigned long last = (block->offset + (block->length-1))
+                                >> TARGET_PAGE_BITS;
+        PostcopyDiscardState *pds = postcopy_discard_send_init(ms,
+                                                               first & 31,
+                                                               block->idstr);
+
+        first32 = first / 32;
+        last32 = last / 32;
+        for (cur32 = first32; cur32 <= last32; cur32++) {
+            unsigned int current_hp;
+            /* Deal with start/end not on alignment */
+            uint32_t mask = make_32bit_mask(first, last, cur32);
+
+            /* a chunk of sent pages */
+            uint32_t sdata = get_32bits_map(ms->sentmap, cur32 * 32);
+            /* a chunk of dirty pages */
+            uint32_t ddata = get_32bits_map(migration_bitmap, cur32 * 32);
+            uint32_t discard = 0;
+            uint32_t redirty = 0;
+            sdata &= mask;
+            ddata &= mask;
+
+            for (current_hp = 0; current_hp < 32; current_hp += host_bits) {
+                uint32_t host_sent = (sdata >> current_hp) & host_mask;
+                uint32_t host_dirty = (ddata >> current_hp) & host_mask;
+
+                if (host_sent && (host_sent != host_mask)) {
+                    /* Partially sent host page */
+                    redirty |= host_mask << current_hp;
+                    discard |= host_mask << current_hp;
+
+                } else if (host_dirty && (host_dirty != host_mask)) {
+                    /* Partially dirty host page */
+                    redirty |= host_mask << current_hp;
+                }
+            }
+            if (discard) {
+                /* Tell the destination to discard these pages */
+                postcopy_discard_send_chunk(ms, pds, (cur32-first32) * 32,
+                                            discard);
+                /* And clear them in the sent data structure */
+                sdata = get_32bits_map(ms->sentmap, cur32 * 32);
+                put_32bits_map(ms->sentmap, cur32 * 32, sdata & ~discard);
+            }
+            if (redirty) {
+                /*
+                 * Reread original dirty bits and OR in ones we clear; we
+                 * must reread since we might be at the start or end of
+                 * a RAMBlock that the original 'mask' discarded some
+                 * bits from
+                */
+                ddata = get_32bits_map(migration_bitmap, cur32 * 32);
+                put_32bits_map(migration_bitmap, cur32 * 32,
+                           ddata | redirty);
+                /* Inc the count of dirty pages */
+                migration_dirty_pages += ctpop32(redirty - (ddata & redirty));
+            }
+        }
+
+        postcopy_discard_send_finish(ms, pds);
+    }
+    /* Easiest way to make sure we don't resume in the middle of a host-page */
+    last_seen_block = NULL;
+    last_sent_block = NULL;
+
+    return 0;
+}
+
+/*
+ * Transmit the set of pages to be discarded after precopy to the target
+ * these are pages that have been sent previously but have been dirtied
+ * Hopefully this is pretty sparse
+ */
+int ram_postcopy_send_discard_bitmap(MigrationState *ms)
+{
+    int ret;
+
+    /* This should be our last sync, the src is now paused */
+    migration_bitmap_sync();
+
+    /* Deal with TPS != HPS */
+    ret = postcopy_chunk_hostpages(ms);
+    if (ret) {
+        return ret;
+    }
+
+    /*
+     * Update the sentmap to be  sentmap&=dirty
+     */
+    bitmap_and(ms->sentmap, ms->sentmap, migration_bitmap,
+               last_ram_offset() >> TARGET_PAGE_BITS);
+
+
+    DPRINTF("Dumping merged sentmap");
+#ifdef DEBUG_POSTCOPY
+    ram_debug_dump_bitmap(ms->sentmap, false);
+#endif
+
+    return pc_each_ram_discard(ms);
+}
+
+/*
+ * At the start of the postcopy phase of migration, any now-dirty
+ * precopied pages are discarded.
+ *
+ * start..end is an inclusive range of bits indexed in the source
+ *    VMs bitmap for this RAMBlock, source_target_page_bits tells
+ *    us what one of those bits represents.
+ *
+ * start/end are offsets from the start of the bitmap for RAMBlock 'block_name'
+ *
+ * Returns 0 on success.
+ */
+int ram_discard_range(MigrationIncomingState *mis,
+                      const char *block_name,
+                      uint64_t start, uint64_t end)
+{
+    assert(end >= start);
+
+    RAMBlock *rb = ram_find_block(block_name);
+
+    if (!rb) {
+        error_report("ram_discard_range: Failed to find block '%s'",
+                     block_name);
+        return -1;
+    }
+
+    uint64_t index_offset = rb->offset >> TARGET_PAGE_BITS;
+    postcopy_pmi_discard_range(mis, start + index_offset, (end - start) + 1);
+
+    /* +1 gives the byte after the end of the last page to be discarded */
+    ram_addr_t end_offset = (end+1) << TARGET_PAGE_BITS;
+    uint8_t *host_startaddr = rb->host + (start << TARGET_PAGE_BITS);
+    uint8_t *host_endaddr;
+
+    if (end_offset <= rb->length) {
+        host_endaddr   = rb->host + (end_offset-1);
+        return postcopy_ram_discard_range(mis, host_startaddr, host_endaddr);
+    } else {
+        error_report("ram_discard_range: Overrun block '%s' (%" PRIu64
+                     "/%" PRIu64 "/%zu)",
+                     block_name, start, end, rb->length);
+        return -1;
+    }
+}
 
 static int ram_save_setup(QEMUFile *f, void *opaque)
 {
@@ -804,7 +1370,6 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
 
         acct_clear();
     }
-
     qemu_mutex_lock_iothread();
     qemu_mutex_lock_ramlist();
     bytes_transferred = 0;
@@ -813,6 +1378,12 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
     ram_bitmap_pages = last_ram_offset() >> TARGET_PAGE_BITS;
     migration_bitmap = bitmap_new(ram_bitmap_pages);
     bitmap_set(migration_bitmap, 0, ram_bitmap_pages);
+
+    if (migrate_postcopy_ram()) {
+        MigrationState *s = migrate_get_current();
+        s->sentmap = bitmap_new(ram_bitmap_pages);
+        bitmap_clear(s->sentmap, 0, ram_bitmap_pages);
+    }
 
     /*
      * Count the total number of pages used by ram blocks not including any
@@ -920,7 +1491,10 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
 static int ram_save_complete(QEMUFile *f, void *opaque)
 {
     qemu_mutex_lock_ramlist();
-    migration_bitmap_sync();
+
+    if (!migration_postcopy_phase(migrate_get_current())) {
+        migration_bitmap_sync();
+    }
 
     ram_control_before_iterate(f, RAM_CONTROL_FINISH);
 
@@ -953,7 +1527,8 @@ static uint64_t ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size)
 
     remaining_size = ram_save_remaining() * TARGET_PAGE_SIZE;
 
-    if (remaining_size < max_size) {
+    if (!migration_postcopy_phase(migrate_get_current()) &&
+        remaining_size < max_size) {
         qemu_mutex_lock_iothread();
         migration_bitmap_sync();
         qemu_mutex_unlock_iothread();
@@ -997,9 +1572,20 @@ static int load_xbzrle(QEMUFile *f, ram_addr_t addr, void *host)
     return 0;
 }
 
+/*
+ * Read a RAMBlock ID from the stream f, find the host address of the
+ * start of that block and add on 'offset'
+ *
+ * f: Stream to read from
+ * mis: MigrationIncomingState
+ * offset: Offset within the block
+ * flags: Page flags (mostly to see if it's a continuation of previous block)
+ * rb: Pointer to RAMBlock* that gets filled in with the RB we find
+ */
 static inline void *host_from_stream_offset(QEMUFile *f,
+                                            MigrationIncomingState *mis,
                                             ram_addr_t offset,
-                                            int flags)
+                                            int flags, RAMBlock **rb)
 {
     static RAMBlock *block = NULL;
     char id[256];
@@ -1010,8 +1596,11 @@ static inline void *host_from_stream_offset(QEMUFile *f,
             error_report("Ack, bad migration stream!");
             return NULL;
         }
+        if (rb) {
+            *rb = block;
+        }
 
-        return memory_region_get_ram_ptr(block->mr) + offset;
+        goto gotit;
     }
 
     len = qemu_get_byte(f);
@@ -1019,12 +1608,22 @@ static inline void *host_from_stream_offset(QEMUFile *f,
     id[len] = 0;
 
     QTAILQ_FOREACH(block, &ram_list.blocks, next) {
-        if (!strncmp(id, block->idstr, sizeof(id)))
-            return memory_region_get_ram_ptr(block->mr) + offset;
+        if (!strncmp(id, block->idstr, sizeof(id))) {
+            if (rb) {
+                *rb = block;
+            }
+            goto gotit;
+        }
     }
 
     error_report("Can't find block %s!", id);
     return NULL;
+
+gotit:
+    postcopy_hook_early_receive(mis,
+        (offset + (*rb)->offset) >> TARGET_PAGE_BITS);
+    return memory_region_get_ram_ptr(block->mr) + offset;
+
 }
 
 /*
@@ -1038,11 +1637,29 @@ void ram_handle_compressed(void *host, uint8_t ch, uint64_t size)
     }
 }
 
+/*
+ * Allocate data structures etc needed by incoming migration with postcopy-ram
+ * postcopy-ram's similarly names postcopy_ram_incoming_init does the work
+ */
+int ram_postcopy_incoming_init(MigrationIncomingState *mis)
+{
+    size_t ram_pages = last_ram_offset() >> TARGET_PAGE_BITS;
+
+    return postcopy_ram_incoming_init(mis, ram_pages);
+}
+
 static int ram_load(QEMUFile *f, void *opaque, int version_id)
 {
     ram_addr_t addr;
     int flags, ret = 0;
     static uint64_t seq_iter;
+    /*
+     * System is running in postcopy mode, page inserts to host memory must be
+     * atomic
+     */
+    MigrationIncomingState *mis = migration_incoming_get_current();
+    bool postcopy_running = mis->postcopy_ram_state >=
+                            POSTCOPY_RAM_INCOMING_LISTENING;
 
     seq_iter++;
 
@@ -1051,6 +1668,7 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
     }
 
     while (!ret) {
+        RAMBlock *rb = 0; /* =0 needed to silence compiler */
         addr = qemu_get_be64(f);
 
         flags = addr & ~TARGET_PAGE_MASK;
@@ -1098,7 +1716,7 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
             void *host;
             uint8_t ch;
 
-            host = host_from_stream_offset(f, addr, flags);
+            host = host_from_stream_offset(f, mis, addr, flags, &rb);
             if (!host) {
                 error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
                 ret = -EINVAL;
@@ -1106,20 +1724,66 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
             }
 
             ch = qemu_get_byte(f);
-            ram_handle_compressed(host, ch, TARGET_PAGE_SIZE);
+            if (!postcopy_running) {
+                ram_handle_compressed(host, ch, TARGET_PAGE_SIZE);
+            } else {
+                if (!ch) {
+                    ret = postcopy_place_zero_page(mis, host,
+                              (addr + rb->offset) >> TARGET_PAGE_BITS);
+                } else {
+                    void *tmp;
+                    tmp = postcopy_get_tmp_page(mis, (addr + rb->offset) >>
+                                                      TARGET_PAGE_BITS);
+
+                    if (!tmp) {
+                        return -ENOMEM;
+                    }
+                    memset(tmp, ch, TARGET_PAGE_SIZE);
+                    ret = postcopy_place_page(mis, host, tmp,
+                              (addr + rb->offset) >> TARGET_PAGE_BITS);
+                }
+                if (ret) {
+                    error_report("ram_load: Failure in postcopy compress @"
+                                 "%zx/%p;%s+%zx",
+                                 addr, host, rb->idstr, rb->offset);
+                    return ret;
+                }
+            }
         } else if (flags & RAM_SAVE_FLAG_PAGE) {
             void *host;
 
-            host = host_from_stream_offset(f, addr, flags);
+            host = host_from_stream_offset(f, mis, addr, flags, &rb);
             if (!host) {
                 error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
                 ret = -EINVAL;
                 break;
             }
 
-            qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
+            if (!postcopy_running) {
+                qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
+            } else {
+                void *tmp = postcopy_get_tmp_page(mis, (addr + rb->offset) >>
+                                                        TARGET_PAGE_BITS);
+
+                if (!tmp) {
+                    return -ENOMEM;
+                }
+                qemu_get_buffer(f, tmp, TARGET_PAGE_SIZE);
+                ret = postcopy_place_page(mis, host, tmp,
+                          (addr + rb->offset) >> TARGET_PAGE_BITS);
+                if (ret) {
+                    error_report("ram_load: Failure in postcopy simple"
+                                 "@%zx/%p;%s+%zx",
+                                 addr, host, rb->idstr, rb->offset);
+                    return ret;
+                }
+            }
         } else if (flags & RAM_SAVE_FLAG_XBZRLE) {
-            void *host = host_from_stream_offset(f, addr, flags);
+            if (postcopy_running) {
+                error_report("XBZRLE RAM block in postcopy mode @%zx\n", addr);
+                return -EINVAL;
+            }
+            void *host = host_from_stream_offset(f, mis, addr, flags, &rb);
             if (!host) {
                 error_report("Illegal RAM offset " RAM_ADDR_FMT, addr);
                 ret = -EINVAL;
@@ -1150,6 +1814,12 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
     return ret;
 }
 
+/* RAM's always up for postcopying */
+static bool ram_can_postcopy(void *opaque)
+{
+    return true;
+}
+
 static SaveVMHandlers savevm_ram_handlers = {
     .save_live_setup = ram_save_setup,
     .save_live_iterate = ram_save_iterate,
@@ -1157,6 +1827,7 @@ static SaveVMHandlers savevm_ram_handlers = {
     .save_live_pending = ram_save_pending,
     .load_state = ram_load,
     .cancel = ram_migration_cancel,
+    .can_postcopy = ram_can_postcopy,
 };
 
 void ram_mig_init(void)

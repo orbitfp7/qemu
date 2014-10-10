@@ -8,13 +8,16 @@ typedef struct QEMUTimerListGroup QEMUTimerListGroup;
 typedef struct QEMUFile QEMUFile;
 typedef struct QEMUBH QEMUBH;
 
+typedef struct AdapterInfo AdapterInfo;
 typedef struct AioContext AioContext;
 
 typedef struct Visitor Visitor;
 
 struct Monitor;
 typedef struct Monitor Monitor;
+typedef struct MigrationIncomingState MigrationIncomingState;
 typedef struct MigrationParams MigrationParams;
+typedef struct MigrationState MigrationState;
 
 typedef struct Property Property;
 typedef struct PropertyInfo PropertyInfo;
@@ -44,6 +47,7 @@ typedef struct PixelFormat PixelFormat;
 typedef struct QemuConsole QemuConsole;
 typedef struct CharDriverState CharDriverState;
 typedef struct MACAddr MACAddr;
+typedef struct MigrationIncomingState MigrationIncomingState;
 typedef struct NetClientState NetClientState;
 typedef struct I2CBus I2CBus;
 typedef struct ISABus ISABus;
@@ -60,6 +64,8 @@ typedef struct PCIEAERLog PCIEAERLog;
 typedef struct PCIEAERErr PCIEAERErr;
 typedef struct PCIEPort PCIEPort;
 typedef struct PCIESlot PCIESlot;
+typedef struct PostcopyDiscardState PostcopyDiscardState;
+typedef struct QEMUSizedBuffer QEMUSizedBuffer;
 typedef struct MSIMessage MSIMessage;
 typedef struct SerialState SerialState;
 typedef struct PCMCIACardState PCMCIACardState;
@@ -73,7 +79,8 @@ typedef struct QEMUSGList QEMUSGList;
 typedef struct SHPCDevice SHPCDevice;
 typedef struct FWCfgState FWCfgState;
 typedef struct PcGuestInfo PcGuestInfo;
+typedef struct PostcopyPMI PostcopyPMI;
 typedef struct Range Range;
-typedef struct AdapterInfo AdapterInfo;
+typedef struct RAMBlock RAMBlock;
 
 #endif /* QEMU_TYPEDEFS_H */

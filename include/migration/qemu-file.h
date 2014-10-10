@@ -25,6 +25,8 @@
 #define QEMU_FILE_H 1
 #include "exec/cpu-common.h"
 
+#include <stdint.h>
+
 /* This function writes a chunk of data to a file at the given position.
  * The pos argument can be ignored if the file is only being used for
  * streaming.  The handler should try to write all of the data it can.
@@ -82,6 +84,19 @@ typedef size_t (QEMURamSaveFunc)(QEMUFile *f, void *opaque,
                                size_t size,
                                int *bytes_sent);
 
+/*
+ * Return a QEMUFile for comms in the opposite direction
+ */
+typedef QEMUFile *(QEMURetPathFunc)(void *opaque);
+
+/*
+ * Stop any read or write (depending on flags) on the underlying
+ * transport on the QEMUFile.
+ * Existing blocking reads/writes must be woken
+ * Returns 0 on success, -err on error
+ */
+typedef int (QEMUFileShutdownFunc)(void *opaque, bool rd, bool wr);
+
 typedef struct QEMUFileOps {
     QEMUFilePutBufferFunc *put_buffer;
     QEMUFileGetBufferFunc *get_buffer;
@@ -92,13 +107,25 @@ typedef struct QEMUFileOps {
     QEMURamHookFunc *after_ram_iterate;
     QEMURamHookFunc *hook_ram_load;
     QEMURamSaveFunc *save_page;
+    QEMURetPathFunc *get_return_path;
+    QEMUFileShutdownFunc *shut_down;
 } QEMUFileOps;
+
+struct QEMUSizedBuffer {
+    struct iovec *iov;
+    size_t n_iov;
+    size_t size; /* total allocated size in all iov's */
+    size_t used; /* number of used bytes */
+};
+
+typedef struct QEMUSizedBuffer QEMUSizedBuffer;
 
 QEMUFile *qemu_fopen_ops(void *opaque, const QEMUFileOps *ops);
 QEMUFile *qemu_fopen(const char *filename, const char *mode);
 QEMUFile *qemu_fdopen(int fd, const char *mode);
 QEMUFile *qemu_fopen_socket(int fd, const char *mode);
 QEMUFile *qemu_popen_cmd(const char *command, const char *mode);
+QEMUFile *qemu_bufopen(const char *mode, QEMUSizedBuffer *input);
 int qemu_get_fd(QEMUFile *f);
 int qemu_fclose(QEMUFile *f);
 int64_t qemu_ftell(QEMUFile *f);
@@ -110,6 +137,22 @@ void qemu_put_byte(QEMUFile *f, int v);
  */
 void qemu_put_buffer_async(QEMUFile *f, const uint8_t *buf, int size);
 bool qemu_file_mode_is_not_valid(const char *mode);
+
+QEMUSizedBuffer *qsb_create(const uint8_t *buffer, size_t len);
+QEMUSizedBuffer *qsb_clone(const QEMUSizedBuffer *);
+void qsb_free(QEMUSizedBuffer *);
+size_t qsb_set_length(QEMUSizedBuffer *qsb, size_t length);
+size_t qsb_get_length(const QEMUSizedBuffer *qsb);
+ssize_t qsb_get_buffer(const QEMUSizedBuffer *, off_t start, size_t count,
+                       uint8_t *buf);
+ssize_t qsb_write_at(QEMUSizedBuffer *qsb, const uint8_t *buf,
+                     off_t pos, size_t count);
+
+
+/*
+ * For use on files opened with qemu_bufopen
+ */
+const QEMUSizedBuffer *qemu_buf_get(QEMUFile *f);
 
 static inline void qemu_put_ubyte(QEMUFile *f, unsigned int v)
 {
@@ -150,6 +193,8 @@ void qemu_file_set_rate_limit(QEMUFile *f, int64_t new_rate);
 int64_t qemu_file_get_rate_limit(QEMUFile *f);
 int qemu_file_get_error(QEMUFile *f);
 void qemu_file_set_error(QEMUFile *f, int ret);
+void qemu_file_shutdown(QEMUFile *f);
+QEMUFile *qemu_file_get_return_path(QEMUFile *f);
 void qemu_fflush(QEMUFile *f);
 
 static inline void qemu_put_be64s(QEMUFile *f, const uint64_t *pv)
@@ -272,4 +317,6 @@ static inline void qemu_get_sbe64s(QEMUFile *f, int64_t *pv)
 {
     qemu_get_be64s(f, (uint64_t *)pv);
 }
+
+int qemu_get_counted_string(QEMUFile *f, uint8_t *buf);
 #endif
