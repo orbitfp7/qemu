@@ -26,6 +26,8 @@ struct QEMUFile {
     unsigned int iovcnt;
 
     int last_error;
+
+    struct QEMUFile *return_path;
 };
 
 typedef struct QEMUFileStdio {
@@ -38,18 +40,88 @@ typedef struct QEMUFileSocket {
     QEMUFile *file;
 } QEMUFileSocket;
 
+/*
+ * Give a QEMUFile* off the same socket but data in the opposite
+ * direction.
+ */
+static QEMUFile *socket_dup_return_path(void *opaque)
+{
+    QEMUFileSocket *qfs = opaque;
+    int revfd;
+    bool this_is_read;
+    QEMUFile *result;
+
+    /* We should only be called once to get a RP on a file */
+    assert(!qfs->file->return_path);
+
+    if (qemu_file_get_error(qfs->file)) {
+        /* If the forward file is in error, don't try and open a return */
+        return NULL;
+    }
+
+    /* I don't think there's a better way to tell which direction 'this' is */
+    this_is_read = qfs->file->ops->get_buffer != NULL;
+
+    revfd = dup(qfs->fd);
+    if (revfd == -1) {
+        error_report("Error duplicating fd for return path: %s",
+                      strerror(errno));
+        return NULL;
+    }
+
+    result = qemu_fopen_socket(revfd, this_is_read ? "wb" : "rb");
+    qfs->file->return_path = result;
+
+    if (!result) {
+        close(revfd);
+    }
+
+    return result;
+}
+
 static ssize_t socket_writev_buffer(void *opaque, struct iovec *iov, int iovcnt,
                                     int64_t pos)
 {
     QEMUFileSocket *s = opaque;
     ssize_t len;
     ssize_t size = iov_size(iov, iovcnt);
+    ssize_t offset = 0;
+    int     err;
 
-    len = iov_send(s->fd, iov, iovcnt, 0, size);
-    if (len < size) {
-        len = -socket_error();
+    while (size > 0) {
+        len = iov_send(s->fd, iov, iovcnt, offset, size);
+
+        if (len > 0) {
+            size -= len;
+            offset += len;
+        }
+
+        if (size > 0) {
+            err = socket_error();
+
+            if (err != EAGAIN) {
+                error_report("socket_writev_buffer: Got err=%d for (%zd/%zd)",
+                             err, size, len);
+                /*
+                 * If I've already sent some but only just got the error, I
+                 * could return the amount validly sent so far and wait for the
+                 * next call to report the error, but I'd rather flag the error
+                 * immediately.
+                 */
+                return -err;
+            }
+
+            /* Emulate blocking */
+            GPollFD pfd;
+
+            pfd.fd = s->fd;
+            pfd.events = G_IO_OUT | G_IO_ERR;
+            pfd.revents = 0;
+            g_poll(&pfd, 1 /* 1 fd */, -1 /* no timeout */);
+        }
     }
-    return len;
+
+    return offset;
 }
 
 static int socket_get_fd(void *opaque)
@@ -88,6 +160,14 @@ static int socket_close(void *opaque)
     closesocket(s->fd);
     g_free(s);
     return 0;
+}
+
+/* qemufile_ to disambiguate from the qemu-sockets.c code which it uses */
+static int qemufile_socket_shutdown(void *opaque, bool rd, bool wr)
+{
+    QEMUFileSocket *s = opaque;
+
+    return socket_shutdown(s->fd, rd, wr);
 }
 
 static int stdio_get_fd(void *opaque)
@@ -335,16 +415,43 @@ QEMUFile *qemu_fdopen(int fd, const char *mode)
 }
 
 static const QEMUFileOps socket_read_ops = {
-    .get_fd =     socket_get_fd,
-    .get_buffer = socket_get_buffer,
-    .close =      socket_close
+    .get_fd          = socket_get_fd,
+    .get_buffer      = socket_get_buffer,
+    .close           = socket_close,
+    .shut_down       = qemufile_socket_shutdown,
+    .get_return_path = socket_dup_return_path
 };
 
 static const QEMUFileOps socket_write_ops = {
-    .get_fd =     socket_get_fd,
-    .writev_buffer = socket_writev_buffer,
-    .close =      socket_close
+    .get_fd          = socket_get_fd,
+    .writev_buffer   = socket_writev_buffer,
+    .close           = socket_close,
+    .shut_down       = qemufile_socket_shutdown,
+    .get_return_path = socket_dup_return_path
 };
+
+/*
+ * Stop a file from being read/written - not all backing files can do this
+ * typically only sockets can.  The caller should make sure they only
+ * call this for things that can.
+ */
+void qemu_file_shutdown(QEMUFile *f)
+{
+    assert(f->ops->shut_down);
+    f->ops->shut_down(f, true, true);
+}
+
+/*
+ * Result: QEMUFile* for a 'return path' for comms in the opposite direction
+ *         NULL if not available
+ */
+QEMUFile *qemu_file_get_return_path(QEMUFile *f)
+{
+    if (!f->ops->get_return_path) {
+        return NULL;
+    }
+    return f->ops->get_return_path(f->opaque);
+}
 
 bool qemu_file_mode_is_not_valid(const char *mode)
 {
@@ -877,4 +984,475 @@ uint64_t qemu_get_be64(QEMUFile *f)
     v = (uint64_t)qemu_get_be32(f) << 32;
     v |= qemu_get_be32(f);
     return v;
+}
+
+/*
+ * Get a string whose length is determined by a single preceding byte
+ * A preallocated 256 byte buffer must be passed in.
+ * Returns: 0 on success and a 0 terminated string in the buffer
+ */
+int qemu_get_counted_string(QEMUFile *f, uint8_t *buf)
+{
+    unsigned int len = qemu_get_byte(f);
+    int res = qemu_get_buffer(f, buf, len);
+
+    buf[len] = 0;
+
+    return res != len;
+}
+
+#define QSB_CHUNK_SIZE      (1 << 10)
+#define QSB_MAX_CHUNK_SIZE  (16 * QSB_CHUNK_SIZE)
+
+/**
+ * Create a QEMUSizedBuffer
+ * This type of buffer uses scatter-gather lists internally and
+ * can grow to any size. Any data array in the scatter-gather list
+ * can hold different amount of bytes.
+ *
+ * @buffer: Optional buffer to copy into the QSB
+ * @len: size of initial buffer; if @buffer is given, buffer must
+ *       hold at least len bytes
+ *
+ * Returns a pointer to a QEMUSizedBuffer or NULL on allocation failure
+ */
+QEMUSizedBuffer *qsb_create(const uint8_t *buffer, size_t len)
+{
+    QEMUSizedBuffer *qsb;
+    size_t alloc_len, num_chunks, i, to_copy;
+    size_t chunk_size = (len > QSB_MAX_CHUNK_SIZE)
+                        ? QSB_MAX_CHUNK_SIZE
+                        : QSB_CHUNK_SIZE;
+
+    num_chunks = DIV_ROUND_UP(len ? len : QSB_CHUNK_SIZE, chunk_size);
+    alloc_len = num_chunks * chunk_size;
+
+    qsb = g_try_new0(QEMUSizedBuffer, 1);
+    if (!qsb) {
+        return NULL;
+    }
+
+    qsb->iov = g_try_new0(struct iovec, num_chunks);
+    if (!qsb->iov) {
+        g_free(qsb);
+        return NULL;
+    }
+
+    qsb->n_iov = num_chunks;
+
+    for (i = 0; i < num_chunks; i++) {
+        qsb->iov[i].iov_base = g_try_malloc0(chunk_size);
+        if (!qsb->iov[i].iov_base) {
+            /* qsb_free is safe since g_free can cope with NULL */
+            qsb_free(qsb);
+            return NULL;
+        }
+
+        qsb->iov[i].iov_len = chunk_size;
+        if (buffer) {
+            to_copy = (len - qsb->used) > chunk_size
+                      ? chunk_size : (len - qsb->used);
+            memcpy(qsb->iov[i].iov_base, &buffer[qsb->used], to_copy);
+            qsb->used += to_copy;
+        }
+    }
+
+    qsb->size = alloc_len;
+
+    return qsb;
+}
+
+/**
+ * Free the QEMUSizedBuffer
+ *
+ * @qsb: The QEMUSizedBuffer to free
+ */
+void qsb_free(QEMUSizedBuffer *qsb)
+{
+    size_t i;
+
+    if (!qsb) {
+        return;
+    }
+
+    for (i = 0; i < qsb->n_iov; i++) {
+        g_free(qsb->iov[i].iov_base);
+    }
+    g_free(qsb->iov);
+    g_free(qsb);
+}
+
+/**
+ * Get the number of used bytes in the QEMUSizedBuffer
+ *
+ * @qsb: A QEMUSizedBuffer
+ *
+ * Returns the number of bytes currently used in this buffer
+ */
+size_t qsb_get_length(const QEMUSizedBuffer *qsb)
+{
+    return qsb->used;
+}
+
+/**
+ * Set the length of the buffer; the primary usage of this
+ * function is to truncate the number of used bytes in the buffer.
+ * The size will not be extended beyond the current number of
+ * allocated bytes in the QEMUSizedBuffer.
+ *
+ * @qsb: A QEMUSizedBuffer
+ * @new_len: The new length of bytes in the buffer
+ *
+ * Returns the number of bytes the buffer was truncated or extended
+ * to.
+ */
+size_t qsb_set_length(QEMUSizedBuffer *qsb, size_t new_len)
+{
+    if (new_len <= qsb->size) {
+        qsb->used = new_len;
+    } else {
+        qsb->used = qsb->size;
+    }
+    return qsb->used;
+}
+
+/**
+ * Get the iovec that holds the data for a given position @pos.
+ *
+ * @qsb: A QEMUSizedBuffer
+ * @pos: The index of a byte in the buffer
+ * @d_off: Pointer to an offset that this function will indicate
+ *         at what position within the returned iovec the byte
+ *         is to be found
+ *
+ * Returns the index of the iovec that holds the byte at the given
+ * index @pos in the byte stream; a negative number if the iovec
+ * for the given position @pos does not exist.
+ */
+static ssize_t qsb_get_iovec(const QEMUSizedBuffer *qsb,
+                             off_t pos, off_t *d_off)
+{
+    ssize_t i;
+    off_t curr = 0;
+
+    if (pos > qsb->used) {
+        return -1;
+    }
+
+    for (i = 0; i < qsb->n_iov; i++) {
+        if (curr + qsb->iov[i].iov_len > pos) {
+            *d_off = pos - curr;
+            return i;
+        }
+        curr += qsb->iov[i].iov_len;
+    }
+    return -1;
+}
+
+/*
+ * Convert the QEMUSizedBuffer into a flat buffer.
+ *
+ * Note: If at all possible, try to avoid this function since it
+ *       may unnecessarily copy memory around.
+ *
+ * @qsb: pointer to QEMUSizedBuffer
+ * @start: offset to start at
+ * @count: number of bytes to copy
+ * @buf: a pointer to a buffer to write into (at least @count bytes)
+ *
+ * Returns the number of bytes copied into the output buffer
+ */
+ssize_t qsb_get_buffer(const QEMUSizedBuffer *qsb, off_t start,
+                       size_t count, uint8_t *buffer)
+{
+    const struct iovec *iov;
+    size_t to_copy, all_copy;
+    ssize_t index;
+    off_t s_off;
+    off_t d_off = 0;
+    char *s;
+
+    if (start > qsb->used) {
+        return 0;
+    }
+
+    all_copy = qsb->used - start;
+    if (all_copy > count) {
+        all_copy = count;
+    } else {
+        count = all_copy;
+    }
+
+    index = qsb_get_iovec(qsb, start, &s_off);
+    if (index < 0) {
+        return 0;
+    }
+
+    while (all_copy > 0) {
+        iov = &qsb->iov[index];
+
+        s = iov->iov_base;
+
+        to_copy = iov->iov_len - s_off;
+        if (to_copy > all_copy) {
+            to_copy = all_copy;
+        }
+        memcpy(&buffer[d_off], &s[s_off], to_copy);
+
+        d_off += to_copy;
+        all_copy -= to_copy;
+
+        s_off = 0;
+        index++;
+    }
+
+    return count;
+}
+
+/**
+ * Grow the QEMUSizedBuffer to the given size and allocate
+ * memory for it.
+ *
+ * @qsb: A QEMUSizedBuffer
+ * @new_size: The new size of the buffer
+ *
+ * Return:
+ *    a negative error code in case of memory allocation failure
+ * or
+ *    the new size of the buffer. The returned size may be greater or equal
+ *    to @new_size.
+ */
+static ssize_t qsb_grow(QEMUSizedBuffer *qsb, size_t new_size)
+{
+    size_t needed_chunks, i;
+
+    if (qsb->size < new_size) {
+        struct iovec *new_iov;
+        size_t size_diff = new_size - qsb->size;
+        size_t chunk_size = (size_diff > QSB_MAX_CHUNK_SIZE)
+                             ? QSB_MAX_CHUNK_SIZE : QSB_CHUNK_SIZE;
+
+        needed_chunks = DIV_ROUND_UP(size_diff, chunk_size);
+
+        new_iov = g_try_malloc_n(qsb->n_iov + needed_chunks,
+                                 sizeof(struct iovec));
+        if (new_iov == NULL) {
+            return -ENOMEM;
+        }
+
+        /* Allocate new chunks as needed into new_iov */
+        for (i = qsb->n_iov; i < qsb->n_iov + needed_chunks; i++) {
+            new_iov[i].iov_base = g_try_malloc0(chunk_size);
+            new_iov[i].iov_len = chunk_size;
+            if (!new_iov[i].iov_base) {
+                size_t j;
+
+                /* Free previously allocated new chunks */
+                for (j = qsb->n_iov; j < i; j++) {
+                    g_free(new_iov[j].iov_base);
+                }
+                g_free(new_iov);
+
+                return -ENOMEM;
+            }
+        }
+
+        /*
+         * Now we can't get any allocation errors, copy over to new iov
+         * and switch.
+         */
+        for (i = 0; i < qsb->n_iov; i++) {
+            new_iov[i] = qsb->iov[i];
+        }
+
+        qsb->n_iov += needed_chunks;
+        g_free(qsb->iov);
+        qsb->iov = new_iov;
+        qsb->size += (needed_chunks * chunk_size);
+    }
+
+    return qsb->size;
+}
+
+/**
+ * Write into the QEMUSizedBuffer at a given position and a given
+ * number of bytes. This function will automatically grow the
+ * QEMUSizedBuffer.
+ *
+ * @qsb: A QEMUSizedBuffer
+ * @source: A byte array to copy data from
+ * @pos: The position within the @qsb to write data to
+ * @size: The number of bytes to copy into the @qsb
+ *
+ * Returns @size or a negative error code in case of memory allocation failure,
+ *           or with an invalid 'pos'
+ */
+ssize_t qsb_write_at(QEMUSizedBuffer *qsb, const uint8_t *source,
+                     off_t pos, size_t count)
+{
+    ssize_t rc = qsb_grow(qsb, pos + count);
+    size_t to_copy;
+    size_t all_copy = count;
+    const struct iovec *iov;
+    ssize_t index;
+    char *dest;
+    off_t d_off, s_off = 0;
+
+    if (rc < 0) {
+        return rc;
+    }
+
+    if (pos + count > qsb->used) {
+        qsb->used = pos + count;
+    }
+
+    index = qsb_get_iovec(qsb, pos, &d_off);
+    if (index < 0) {
+        return -EINVAL;
+    }
+
+    while (all_copy > 0) {
+        iov = &qsb->iov[index];
+
+        dest = iov->iov_base;
+
+        to_copy = iov->iov_len - d_off;
+        if (to_copy > all_copy) {
+            to_copy = all_copy;
+        }
+
+        memcpy(&dest[d_off], &source[s_off], to_copy);
+
+        s_off += to_copy;
+        all_copy -= to_copy;
+
+        d_off = 0;
+        index++;
+    }
+
+    return count;
+}
+
+/**
+ * Create a deep copy of the given QEMUSizedBuffer.
+ *
+ * @qsb: A QEMUSizedBuffer
+ *
+ * Returns a clone of @qsb or NULL on allocation failure
+ */
+QEMUSizedBuffer *qsb_clone(const QEMUSizedBuffer *qsb)
+{
+    QEMUSizedBuffer *out = qsb_create(NULL, qsb_get_length(qsb));
+    size_t i;
+    ssize_t res;
+    off_t pos = 0;
+
+    if (!out) {
+        return NULL;
+    }
+
+    for (i = 0; i < qsb->n_iov; i++) {
+        res =  qsb_write_at(out, qsb->iov[i].iov_base,
+                            pos, qsb->iov[i].iov_len);
+        if (res < 0) {
+            qsb_free(out);
+            return NULL;
+        }
+        pos += res;
+    }
+
+    return out;
+}
+
+typedef struct QEMUBuffer {
+    QEMUSizedBuffer *qsb;
+    QEMUFile *file;
+} QEMUBuffer;
+
+static int buf_get_buffer(void *opaque, uint8_t *buf, int64_t pos, int size)
+{
+    QEMUBuffer *s = opaque;
+    ssize_t len = qsb_get_length(s->qsb) - pos;
+
+    if (len <= 0) {
+        return 0;
+    }
+
+    if (len > size) {
+        len = size;
+    }
+    return qsb_get_buffer(s->qsb, pos, len, buf);
+}
+
+static int buf_put_buffer(void *opaque, const uint8_t *buf,
+                          int64_t pos, int size)
+{
+    QEMUBuffer *s = opaque;
+
+    return qsb_write_at(s->qsb, buf, pos, size);
+}
+
+static int buf_close(void *opaque)
+{
+    QEMUBuffer *s = opaque;
+
+    qsb_free(s->qsb);
+
+    g_free(s);
+
+    return 0;
+}
+
+const QEMUSizedBuffer *qemu_buf_get(QEMUFile *f)
+{
+    QEMUBuffer *p;
+
+    qemu_fflush(f);
+
+    p = f->opaque;
+
+    return p->qsb;
+}
+
+static const QEMUFileOps buf_read_ops = {
+    .get_buffer = buf_get_buffer,
+    .close =      buf_close,
+};
+
+static const QEMUFileOps buf_write_ops = {
+    .put_buffer = buf_put_buffer,
+    .close =      buf_close,
+};
+
+QEMUFile *qemu_bufopen(const char *mode, QEMUSizedBuffer *input)
+{
+    QEMUBuffer *s;
+
+    if (mode == NULL || (mode[0] != 'r' && mode[0] != 'w') ||
+        mode[1] != '\0') {
+        error_report("qemu_bufopen: Argument validity check failed");
+        return NULL;
+    }
+
+    s = g_malloc0(sizeof(QEMUBuffer));
+    if (mode[0] == 'r') {
+        s->qsb = input;
+    }
+
+    if (s->qsb == NULL) {
+        s->qsb = qsb_create(NULL, 0);
+    }
+    if (!s->qsb) {
+        g_free(s);
+        error_report("qemu_bufopen: qsb_create failed");
+        return NULL;
+    }
+
+
+    if (mode[0] == 'r') {
+        s->file = qemu_fopen_ops(s, &buf_read_ops);
+    } else {
+        s->file = qemu_fopen_ops(s, &buf_write_ops);
+    }
+    return s->file;
 }

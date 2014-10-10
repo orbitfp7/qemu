@@ -981,3 +981,31 @@ int socket_dgram(SocketAddress *remote, SocketAddress *local, Error **errp)
     qemu_opts_del(opts);
     return fd;
 }
+
+int socket_shutdown(int fd, bool rd, bool wr)
+{
+    int how = 0;
+
+#ifndef WIN32
+    if (rd) {
+        how = SHUT_RD;
+    }
+
+    if (wr) {
+        how = rd ? SHUT_RDWR : SHUT_WR;
+    }
+
+#else
+    /* Untested */
+    if (rd) {
+        how = SD_RECEIVE;
+    }
+
+    if (wr) {
+        how = rd ? SD_BOTH : SD_SEND;
+    }
+
+#endif
+
+    return shutdown(fd, how);
+}
