@@ -906,7 +906,6 @@ static int open_return_path_on_source(MigrationState *ms)
     return 0;
 }
 
-__attribute__ (( unused )) /* Until later in patch series */
 /* Returns 0 if the RP was ok, otherwise there was an error on the RP */
 static int await_return_path_close_on_source(MigrationState *ms)
 {
@@ -1024,6 +1023,68 @@ fail:
 }
 
 /*
+ * Used by migration_thread when there's not much left pending.
+ * The caller 'breaks' the loop when this returns.
+ */
+static void migration_thread_end_of_iteration(MigrationState *s,
+                                              int current_active_state,
+                                              bool *old_vm_running,
+                                              int64_t *start_time)
+{
+    int ret;
+    if (s->state == MIGRATION_STATUS_ACTIVE) {
+        qemu_mutex_lock_iothread();
+        *start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
+        *old_vm_running = runstate_is_running();
+
+        ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
+        if (ret >= 0) {
+            qemu_file_set_rate_limit(s->file, INT64_MAX);
+            qemu_savevm_state_complete_precopy(s->file);
+        }
+        qemu_mutex_unlock_iothread();
+
+        if (ret < 0) {
+            goto fail;
+        }
+    } else if (s->state == MIGRATION_STATUS_POSTCOPY_ACTIVE) {
+        trace_migration_thread_end_of_iteration_postcopy_end();
+
+        qemu_savevm_state_complete_postcopy(s->file);
+        trace_migration_thread_end_of_iteration_postcopy_end_after_complete();
+    }
+
+    /*
+     * If rp was opened we must clean up the thread before
+     * cleaning everything else up (since if there are no failures
+     * it will wait for the destination to send it's status in
+     * a SHUT command).
+     * Postcopy opens rp if enabled (even if it's not avtivated)
+     */
+    if (migrate_postcopy_ram()) {
+        int rp_error;
+        trace_migration_thread_end_of_iteration_postcopy_end_before_rp();
+        rp_error = await_return_path_close_on_source(s);
+        trace_migration_thread_end_of_iteration_postcopy_end_after_rp(rp_error);
+        if (rp_error) {
+            goto fail;
+        }
+    }
+
+    if (qemu_file_get_error(s->file)) {
+        trace_migration_thread_end_of_iteration_file_err();
+        goto fail;
+    }
+
+    migrate_set_state(s, current_active_state, MIGRATION_STATUS_COMPLETED);
+    return;
+
+fail:
+    migrate_set_state(s, current_active_state, MIGRATION_STATUS_FAILED);
+}
+
+/*
  * Master migration thread on the source VM.
  * It drives the migration and pumps the data down the outgoing channel.
  */
@@ -1098,31 +1159,11 @@ static void *migration_thread(void *opaque)
                 /* Just another iteration step */
                 qemu_savevm_state_iterate(s->file);
             } else {
-                int ret;
+                trace_migration_thread_low_pending(pending_size);
 
-                qemu_mutex_lock_iothread();
-                start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-                qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
-                old_vm_running = runstate_is_running();
-
-                ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
-                if (ret >= 0) {
-                    qemu_file_set_rate_limit(s->file, INT64_MAX);
-                    qemu_savevm_state_complete_precopy(s->file);
-                }
-                qemu_mutex_unlock_iothread();
-
-                if (ret < 0) {
-                    migrate_set_state(s, MIGRATION_STATUS_ACTIVE,
-                                      MIGRATION_STATUS_FAILED);
-                    break;
-                }
-
-                if (!qemu_file_get_error(s->file)) {
-                    migrate_set_state(s, MIGRATION_STATUS_ACTIVE,
-                                      MIGRATION_STATUS_COMPLETED);
-                    break;
-                }
+                migration_thread_end_of_iteration(s, current_active_type,
+                    &old_vm_running, &start_time);
+                break;
             }
         }
 
