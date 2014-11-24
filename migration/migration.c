@@ -894,7 +894,6 @@ static int open_outgoing_return_path(MigrationState *ms)
     return 0;
 }
 
-__attribute__ (( unused )) /* Until later in patch series */
 static void await_outgoing_return_path_close(MigrationState *ms)
 {
     /*
@@ -1010,6 +1009,64 @@ fail:
 }
 
 /*
+ * Used by migration_thread when there's not much left pending.
+ * The caller 'breaks' the loop when this returns.
+ */
+static void migration_thread_end_of_iteration(MigrationState *s,
+                                              int current_active_state,
+                                              bool *old_vm_running,
+                                              int64_t *start_time)
+{
+    int ret;
+    if (s->state == MIG_STATE_ACTIVE) {
+        qemu_mutex_lock_iothread();
+        *start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
+        *old_vm_running = runstate_is_running();
+
+        ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
+        if (ret >= 0) {
+            qemu_file_set_rate_limit(s->file, INT64_MAX);
+            qemu_savevm_state_complete(s->file);
+        }
+        qemu_mutex_unlock_iothread();
+
+        if (ret < 0) {
+            goto fail;
+        }
+    } else if (s->state == MIG_STATE_POSTCOPY_ACTIVE) {
+        trace_migration_thread_end_of_iteration_postcopy_end();
+
+        qemu_savevm_state_postcopy_complete(s->file);
+        trace_migration_thread_end_of_iteration_postcopy_end_after_complete();
+    }
+
+    /*
+     * If rp was opened we must clean up the thread before
+     * cleaning everything else up (since if there are no failures
+     * it will wait for the destination to send it's status in
+     * a SHUT command).
+     * Postcopy opens rp if enabled (even if it's not avtivated)
+     */
+    if (migrate_postcopy_ram()) {
+        trace_migration_thread_end_of_iteration_postcopy_end_before_rp();
+        await_outgoing_return_path_close(s);
+        trace_migration_thread_end_of_iteration_postcopy_end_after_rp();
+    }
+
+    if (qemu_file_get_error(s->file)) {
+        trace_migration_thread_end_of_iteration_file_err();
+        goto fail;
+    }
+
+    migrate_set_state(s, current_active_state, MIG_STATE_COMPLETED);
+    return;
+
+fail:
+    migrate_set_state(s, current_active_state, MIG_STATE_ERROR);
+}
+
+/*
  * Master migration thread on the source VM.
  * It drives the migration and pumps the data down the outgoing channel.
  */
@@ -1084,29 +1141,11 @@ static void *migration_thread(void *opaque)
                 /* Just another iteration step */
                 qemu_savevm_state_iterate(s->file);
             } else {
-                int ret;
+                trace_migration_thread_low_pending(pending_size);
 
-                qemu_mutex_lock_iothread();
-                start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-                qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
-                old_vm_running = runstate_is_running();
-
-                ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
-                if (ret >= 0) {
-                    qemu_file_set_rate_limit(s->file, INT64_MAX);
-                    qemu_savevm_state_complete(s->file);
-                }
-                qemu_mutex_unlock_iothread();
-
-                if (ret < 0) {
-                    migrate_set_state(s, MIG_STATE_ACTIVE, MIG_STATE_ERROR);
-                    break;
-                }
-
-                if (!qemu_file_get_error(s->file)) {
-                    migrate_set_state(s, MIG_STATE_ACTIVE, MIG_STATE_COMPLETED);
-                    break;
-                }
+                migration_thread_end_of_iteration(s, current_active_type,
+                    &old_vm_running, &start_time);
+                break;
             }
         }
 
