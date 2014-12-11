@@ -616,6 +616,13 @@ bool qemu_savevm_state_blocked(Error **errp)
     return false;
 }
 
+void qemu_savevm_state_header(QEMUFile *f)
+{
+    trace_savevm_state_header();
+    qemu_put_be32(f, QEMU_VM_FILE_MAGIC);
+    qemu_put_be32(f, QEMU_VM_FILE_VERSION);
+}
+
 void qemu_savevm_state_begin(QEMUFile *f,
                              const MigrationParams *params)
 {
@@ -629,9 +636,6 @@ void qemu_savevm_state_begin(QEMUFile *f,
         }
         se->ops->set_params(params, se->opaque);
     }
-
-    qemu_put_be32(f, QEMU_VM_FILE_MAGIC);
-    qemu_put_be32(f, QEMU_VM_FILE_VERSION);
 
     QTAILQ_FOREACH(se, &savevm_handlers, entry) {
         int len;
@@ -842,6 +846,7 @@ static int qemu_savevm_state(QEMUFile *f, Error **errp)
     }
 
     qemu_mutex_unlock_iothread();
+    qemu_savevm_state_header(f);
     qemu_savevm_state_begin(f, &params);
     qemu_mutex_lock_iothread();
 
