@@ -70,6 +70,7 @@ MigrationIncomingState *migration_incoming_state_new(QEMUFile* f)
 {
     mis_current = g_malloc0(sizeof(MigrationIncomingState));
     mis_current->file = f;
+    QLIST_INIT(&mis_current->loadvm_handlers);
     qemu_mutex_init(&mis_current->rp_mutex);
 
     return mis_current;
@@ -77,6 +78,7 @@ MigrationIncomingState *migration_incoming_state_new(QEMUFile* f)
 
 void migration_incoming_state_destroy(void)
 {
+    loadvm_free_handlers(mis_current);
     g_free(mis_current);
     mis_current = NULL;
 }

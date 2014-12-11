@@ -50,9 +50,14 @@ enum mig_rp_message_type {
 
 typedef struct MigrationState MigrationState;
 
+typedef QLIST_HEAD(, LoadStateEntry) LoadStateEntry_Head;
+
 /* State for the incoming migration */
 struct MigrationIncomingState {
     QEMUFile *file;
+
+    /* See savevm.c */
+    LoadStateEntry_Head loadvm_handlers;
 
     QEMUFile *return_path;
     QemuMutex      rp_mutex;    /* We send replies from multiple threads */
