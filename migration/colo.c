@@ -60,6 +60,18 @@ static void secondary_vm_do_failover(void)
         /* recover runstate to normal migration finish state */
         autostart = true;
     }
+    /*
+    * Make sure colo incoming thread not block in recv or send,
+    * If mis->from_src_file and mis->to_src_file use the same fd,
+    * The second shutdown() will return -1, we ignore this value,
+    * it is harmless.
+    */
+    if (mis->from_src_file) {
+        qemu_file_shutdown(mis->from_src_file);
+    }
+    if (mis->to_src_file) {
+        qemu_file_shutdown(mis->to_src_file);
+    }
 
     old_state = failover_set_state(FAILOVER_STATUS_HANDLING,
                                    FAILOVER_STATUS_COMPLETED);
@@ -81,6 +93,18 @@ static void primary_vm_do_failover(void)
 
     migrate_set_state(&s->state, MIGRATION_STATUS_COLO,
                       MIGRATION_STATUS_COMPLETED);
+
+    /*
+    * Make sure colo thread no block in recv or send,
+    * The s->rp_state.from_dst_file and s->to_dst_file may use the
+    * same fd, but we still shutdown the fd for twice, it is harmless.
+    */
+    if (s->to_dst_file) {
+        qemu_file_shutdown(s->to_dst_file);
+    }
+    if (s->rp_state.from_dst_file) {
+        qemu_file_shutdown(s->rp_state.from_dst_file);
+    }
 
     old_state = failover_set_state(FAILOVER_STATUS_HANDLING,
                                    FAILOVER_STATUS_COMPLETED);
@@ -348,7 +372,7 @@ static void colo_process_checkpoint(MigrationState *s)
     }
 
 out:
-    if (ret < 0) {
+    if (ret < 0 || (!ret && !failover_request_is_active())) {
         error_report("%s: %s", __func__, strerror(-ret));
         qapi_event_send_colo_exit(COLO_MODE_PRIMARY, COLO_EXIT_REASON_ERROR,
                                   true, strerror(-ret), NULL);
@@ -360,6 +384,15 @@ out:
     qsb_free(buffer);
     buffer = NULL;
 
+    /* Hope this not to be too long to loop here */
+    while (failover_get_state() != FAILOVER_STATUS_COMPLETED) {
+        ;
+    }
+    /*
+    * Must be called after failover BH is completed,
+    * Or the failover BH may shutdown the wrong fd, that
+    * re-used by other thread after we release here.
+    */
     if (s->rp_state.from_dst_file) {
         qemu_fclose(s->rp_state.from_dst_file);
     }
@@ -519,7 +552,7 @@ void *colo_process_incoming_thread(void *opaque)
     }
 
 out:
-    if (ret < 0) {
+    if (ret < 0 || (!ret && !failover_request_is_active())) {
         error_report("colo incoming thread will exit, detect error: %s",
                      strerror(-ret));
         qapi_event_send_colo_exit(COLO_MODE_SECONDARY, COLO_EXIT_REASON_ERROR,
@@ -539,6 +572,11 @@ out:
     */
     colo_release_ram_cache();
 
+    /* Hope this not to be too long to loop here */
+    while (failover_get_state() != FAILOVER_STATUS_COMPLETED) {
+        ;
+    }
+    /* Must be called after failover BH is completed */
     if (mis->to_src_file) {
         qemu_fclose(mis->to_src_file);
     }
