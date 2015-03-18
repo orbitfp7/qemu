@@ -434,6 +434,53 @@ int qemu_get_buffer(QEMUFile *f, uint8_t *buf, int size)
 }
 
 /*
+ * Read 'size' bytes of data from the file.
+ * 'size' can be larger than the internal buffer.
+ *
+ * The data:
+ *   may be held on an internal buffer (in which case *buf is updated
+ *     to point to it) that is valid until the next qemu_file operation.
+ * OR
+ *   will be copied to the *buf that was passed in.
+ *
+ * The code tries to avoid the copy if possible.
+ *
+ * It will return size bytes unless there was an error, in which case it will
+ * return as many as it managed to read (assuming blocking fd's which
+ * all current QEMUFile are)
+ *
+ * Note: Since **buf may get changed, the caller should take care to
+ *       keep a pointer to the original buffer if it needs to deallocate it.
+ */
+int qemu_get_buffer_in_place(QEMUFile *f, uint8_t **buf, int size)
+{
+    int pending = size;
+    int done = 0;
+    bool first = true;
+
+    while (pending > 0) {
+        int res;
+        uint8_t *src;
+
+        res = qemu_peek_buffer(f, &src, MIN(pending, IO_BUF_SIZE), 0);
+        if (res == 0) {
+            return done;
+        }
+        qemu_file_skip(f, res);
+        done += res;
+        pending -= res;
+        if (first && res == size) {
+            *buf = src;
+            break;
+        }
+        first = false;
+        memcpy(buf, src, res);
+        buf += res;
+    }
+    return done;
+}
+
+/*
  * Peeks a single byte from the buffer; this isn't guaranteed to work if
  * offset leaves a gap after the previous read/peeked data.
  */
