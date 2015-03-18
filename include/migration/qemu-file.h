@@ -157,7 +157,7 @@ static inline void qemu_put_ubyte(QEMUFile *f, unsigned int v)
 void qemu_put_be16(QEMUFile *f, unsigned int v);
 void qemu_put_be32(QEMUFile *f, unsigned int v);
 void qemu_put_be64(QEMUFile *f, uint64_t v);
-int qemu_peek_buffer(QEMUFile *f, uint8_t *buf, int size, size_t offset);
+int qemu_peek_buffer(QEMUFile *f, uint8_t **buf, int size, size_t offset);
 int qemu_get_buffer(QEMUFile *f, uint8_t *buf, int size);
 /*
  * Note that you can only peek continuous bytes from where the current pointer
