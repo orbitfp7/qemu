@@ -1176,7 +1176,7 @@ savevm_section_end(const char *id, unsigned int section_id, int ret) "%s, sectio
 savevm_state_begin(void) ""
 savevm_state_header(void) ""
 savevm_state_iterate(void) ""
-savevm_state_complete(void) ""
+savevm_state_complete_precopy(void) ""
 savevm_state_cancel(void) ""
 vmstate_save(const char *idstr, const char *vmsd_name) "%s, %s"
 vmstate_load(const char *idstr, const char *vmsd_name) "%s, %s"
