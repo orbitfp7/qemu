@@ -3419,6 +3419,12 @@ static void rdma_accept_incoming_migration(void *opaque)
     Error *local_err = NULL, **errp = &local_err;
 
     trace_qemu_rdma_accept_incoming_migration();
+
+    if (migrate_postcopy_ram()) {
+        ERROR(errp, "Postcopy is not currently compatible with RDMA");
+        return;
+    }
+
     ret = qemu_rdma_accept(rdma);
 
     if (ret) {
