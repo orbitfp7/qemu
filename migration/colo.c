@@ -18,6 +18,7 @@
 #include "qemu/error-report.h"
 #include "qemu/sockets.h"
 #include "migration/failover.h"
+#include "qapi-event.h"
 
 /* colo buffer */
 #define COLO_BUFFER_BASE_SIZE (4 * 1024 * 1024)
@@ -349,6 +350,11 @@ static void colo_process_checkpoint(MigrationState *s)
 out:
     if (ret < 0) {
         error_report("%s: %s", __func__, strerror(-ret));
+        qapi_event_send_colo_exit(COLO_MODE_PRIMARY, COLO_EXIT_REASON_ERROR,
+                                  true, strerror(-ret), NULL);
+    } else {
+        qapi_event_send_colo_exit(COLO_MODE_PRIMARY, COLO_EXIT_REASON_REQUEST,
+                                  false, NULL, NULL);
     }
 
     qsb_free(buffer);
@@ -516,6 +522,11 @@ out:
     if (ret < 0) {
         error_report("colo incoming thread will exit, detect error: %s",
                      strerror(-ret));
+        qapi_event_send_colo_exit(COLO_MODE_SECONDARY, COLO_EXIT_REASON_ERROR,
+                                  true, strerror(-ret), NULL);
+    } else {
+        qapi_event_send_colo_exit(COLO_MODE_SECONDARY, COLO_EXIT_REASON_REQUEST,
+                                  false, NULL, NULL);
     }
 
     if (fb) {
