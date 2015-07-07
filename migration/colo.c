@@ -216,6 +216,8 @@ static void colo_process_checkpoint(MigrationState *s)
     int64_t current_time, checkpoint_time = qemu_clock_get_ms(QEMU_CLOCK_HOST);
     int ret = 0;
 
+    failover_init_state();
+
     s->rp_state.from_dst_file = qemu_file_get_return_path(s->to_dst_file);
     if (!s->rp_state.from_dst_file) {
         ret = -EINVAL;
@@ -323,6 +325,8 @@ void *colo_process_incoming_thread(void *opaque)
 
     migrate_set_state(&mis->state, MIGRATION_STATUS_ACTIVE,
                       MIGRATION_STATUS_COLO);
+
+    failover_init_state();
 
     mis->to_src_file = qemu_file_get_return_path(mis->from_src_file);
     if (!mis->to_src_file) {
