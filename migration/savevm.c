@@ -1314,7 +1314,7 @@ static int loadvm_postcopy_ram_handle_discard(MigrationIncomingState *mis,
     switch (ps) {
     case POSTCOPY_INCOMING_ADVISE:
         /* 1st discard */
-        tmp = 0; /* TODO: later patch postcopy_ram_prepare_discard(mis); */
+        tmp = postcopy_ram_prepare_discard(mis);
         if (tmp) {
             return tmp;
         }
@@ -1445,6 +1445,13 @@ static int loadvm_postcopy_handle_listen(MigrationIncomingState *mis)
     if (ps != POSTCOPY_INCOMING_ADVISE && ps != POSTCOPY_INCOMING_DISCARD) {
         error_report("CMD_POSTCOPY_LISTEN in wrong postcopy state (%d)", ps);
         return -1;
+    }
+    if (ps == POSTCOPY_INCOMING_ADVISE) {
+        /*
+         * A rare case, we entered listen without having to do any discards,
+         * so do the setup that's normally done at the time of the 1st discard.
+         */
+        postcopy_ram_prepare_discard(mis);
     }
 
     /*
