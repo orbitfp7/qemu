@@ -1324,6 +1324,50 @@ fail:
     return -1;
 }
 
+/**
+ * migration_completion: Used by migration_thread when there's not much left
+ *   pending. The caller 'breaks' the loop when this returns.
+ *
+ * @s: Current migration state
+ * @current_active_state: The migration state we expect to be in
+ * @*old_vm_running: Pointer to old_vm_running flag
+ * @*start_time: Pointer to time to update
+ */
+static void migration_completion(MigrationState *s, int current_active_state,
+                                 bool *old_vm_running, int64_t *start_time)
+{
+    int ret;
+    qemu_mutex_lock_iothread();
+    *start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
+    *old_vm_running = runstate_is_running();
+    ret = global_state_store();
+
+    if (!ret) {
+        ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
+        if (ret >= 0) {
+            qemu_file_set_rate_limit(s->file, INT64_MAX);
+            qemu_savevm_state_complete_precopy(s->file);
+        }
+    }
+    qemu_mutex_unlock_iothread();
+
+    if (ret < 0) {
+        goto fail;
+    }
+
+    if (qemu_file_get_error(s->file)) {
+        trace_migration_completion_file_err();
+        goto fail;
+    }
+
+    migrate_set_state(s, current_active_state, MIGRATION_STATUS_COMPLETED);
+    return;
+
+fail:
+    migrate_set_state(s, current_active_state, MIGRATION_STATUS_FAILED);
+}
+
 /*
  * Master migration thread on the source VM.
  * It drives the migration and pumps the data down the outgoing channel.
@@ -1401,34 +1445,11 @@ static void *migration_thread(void *opaque)
                 /* Just another iteration step */
                 qemu_savevm_state_iterate(s->file);
             } else {
-                int ret;
+                trace_migration_thread_low_pending(pending_size);
 
-                qemu_mutex_lock_iothread();
-                start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-                qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
-                old_vm_running = runstate_is_running();
-
-                ret = global_state_store();
-                if (!ret) {
-                    ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
-                    if (ret >= 0) {
-                        qemu_file_set_rate_limit(s->file, INT64_MAX);
-                        qemu_savevm_state_complete_precopy(s->file);
-                    }
-                }
-                qemu_mutex_unlock_iothread();
-
-                if (ret < 0) {
-                    migrate_set_state(s, MIGRATION_STATUS_ACTIVE,
-                                      MIGRATION_STATUS_FAILED);
-                    break;
-                }
-
-                if (!qemu_file_get_error(s->file)) {
-                    migrate_set_state(s, MIGRATION_STATUS_ACTIVE,
-                                      MIGRATION_STATUS_COMPLETED);
-                    break;
-                }
+                migration_completion(s, current_active_state, &old_vm_running,
+                                     &start_time);
+                break;
             }
         }
 
