@@ -1425,7 +1425,7 @@ int qemu_ram_resize(ram_addr_t base, ram_addr_t newsize, Error **errp)
 
     assert(block);
 
-    newsize = TARGET_PAGE_ALIGN(newsize);
+    newsize = HOST_PAGE_ALIGN(newsize);
 
     if (block->used_length == newsize) {
         return 0;
@@ -1569,7 +1569,7 @@ ram_addr_t qemu_ram_alloc_from_file(ram_addr_t size, MemoryRegion *mr,
         return -1;
     }
 
-    size = TARGET_PAGE_ALIGN(size);
+    size = HOST_PAGE_ALIGN(size);
     new_block = g_malloc0(sizeof(*new_block));
     new_block->mr = mr;
     new_block->used_length = size;
@@ -1604,8 +1604,8 @@ ram_addr_t qemu_ram_alloc_internal(ram_addr_t size, ram_addr_t max_size,
     ram_addr_t addr;
     Error *local_err = NULL;
 
-    size = TARGET_PAGE_ALIGN(size);
-    max_size = TARGET_PAGE_ALIGN(max_size);
+    size = HOST_PAGE_ALIGN(size);
+    max_size = HOST_PAGE_ALIGN(max_size);
     new_block = g_malloc0(sizeof(*new_block));
     new_block->mr = mr;
     new_block->resized = resized;
