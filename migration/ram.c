@@ -2212,6 +2212,7 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
     void *postcopy_host_page = NULL;
     bool postcopy_place_needed = false;
     bool matching_page_sizes = qemu_host_page_size == TARGET_PAGE_SIZE;
+    void *last_host = NULL;
 
     seq_iter++;
 
@@ -2264,6 +2265,14 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
                 /* If all TP are zero then we can optimise the place */
                 if (!((uintptr_t)host & ~qemu_host_page_mask)) {
                     all_zero = true;
+                } else {
+                    /* not the 1st TP within the HP */
+                    if (host != (last_host + TARGET_PAGE_SIZE)) {
+                        error_report("Non-sequential target page %p/%p\n",
+                                      host, last_host);
+                        ret = -EINVAL;
+                        break;
+                    }
                 }
 
                 /*
@@ -2274,6 +2283,7 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
                                          ~qemu_host_page_mask) == 0;
                 postcopy_place_source = postcopy_host_page;
             }
+            last_host = host;
         }
 
         switch (flags & ~RAM_SAVE_FLAG_CONTINUE) {
