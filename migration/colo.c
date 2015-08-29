@@ -41,6 +41,40 @@ bool migration_incoming_in_colo_state(void)
     return mis && (mis->state == MIGRATION_STATUS_COLO);
 }
 
+static bool colo_runstate_is_stopped(void)
+{
+    return runstate_check(RUN_STATE_COLO) || !runstate_is_running();
+}
+
+static void primary_vm_do_failover(void)
+{
+    MigrationState *s = migrate_get_current();
+    int old_state;
+
+    migrate_set_state(&s->state, MIGRATION_STATUS_COLO,
+                      MIGRATION_STATUS_COMPLETED);
+
+    old_state = failover_set_state(FAILOVER_STATUS_HANDLING,
+                                   FAILOVER_STATUS_COMPLETED);
+    if (old_state != FAILOVER_STATUS_HANDLING) {
+        error_report("Incorrect state (%d) while doing failover for Primary VM",
+                     old_state);
+        return;
+    }
+}
+
+void colo_do_failover(MigrationState *s)
+{
+    /* Make sure vm stopped while failover */
+    if (!colo_runstate_is_stopped()) {
+        vm_stop_force_state(RUN_STATE_COLO);
+    }
+
+    if (get_colo_mode() == COLO_MODE_PRIMARY) {
+        primary_vm_do_failover();
+    }
+}
+
 static int colo_put_cmd(QEMUFile *f, uint32_t cmd)
 {
     int ret;
@@ -150,9 +184,22 @@ static int colo_do_checkpoint_transaction(MigrationState *s,
     }
 
     qemu_mutex_lock_iothread();
+    if (failover_request_is_active()) {
+        qemu_mutex_unlock_iothread();
+        ret = -1;
+        goto out;
+    }
     vm_stop_force_state(RUN_STATE_COLO);
     qemu_mutex_unlock_iothread();
     trace_colo_vm_state_change("run", "stop");
+    /*
+     * failover request bh could be called after
+     * vm_stop_force_state so we check failover_request_is_active() again.
+     */
+    if (failover_request_is_active()) {
+        ret = -1;
+        goto out;
+    }
 
     /* Disable block migration */
     s->params.blk = 0;
@@ -248,6 +295,11 @@ static void colo_process_checkpoint(MigrationState *s)
     trace_colo_vm_state_change("stop", "run");
 
     while (s->state == MIGRATION_STATUS_COLO) {
+        if (failover_request_is_active()) {
+            error_report("failover request");
+            goto out;
+        }
+
         current_time = qemu_clock_get_ms(QEMU_CLOCK_HOST);
         if (current_time - checkpoint_time <
             s->parameters[MIGRATION_PARAMETER_X_CHECKPOINT_DELAY]) {
@@ -269,8 +321,6 @@ out:
     if (ret < 0) {
         error_report("%s: %s", __func__, strerror(-ret));
     }
-    migrate_set_state(&s->state, MIGRATION_STATUS_COLO,
-                      MIGRATION_STATUS_COMPLETED);
 
     qsb_free(buffer);
     buffer = NULL;
