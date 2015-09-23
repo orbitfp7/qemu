@@ -135,6 +135,8 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 
 #if defined(CONFIG_MADVISE)
 
+#include <sys/mman.h>
+
 #define QEMU_MADV_WILLNEED  MADV_WILLNEED
 #define QEMU_MADV_DONTNEED  MADV_DONTNEED
 #ifdef MADV_DONTFORK
@@ -167,6 +169,11 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 #else
 #define QEMU_MADV_HUGEPAGE QEMU_MADV_INVALID
 #endif
+#ifdef MADV_NOHUGEPAGE
+#define QEMU_MADV_NOHUGEPAGE MADV_NOHUGEPAGE
+#else
+#define QEMU_MADV_NOHUGEPAGE QEMU_MADV_INVALID
+#endif
 
 #elif defined(CONFIG_POSIX_MADVISE)
 
@@ -178,6 +185,7 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 #define QEMU_MADV_DODUMP QEMU_MADV_INVALID
 #define QEMU_MADV_DONTDUMP QEMU_MADV_INVALID
 #define QEMU_MADV_HUGEPAGE  QEMU_MADV_INVALID
+#define QEMU_MADV_NOHUGEPAGE  QEMU_MADV_INVALID
 
 #else /* no-op */
 
@@ -189,6 +197,7 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 #define QEMU_MADV_DODUMP QEMU_MADV_INVALID
 #define QEMU_MADV_DONTDUMP QEMU_MADV_INVALID
 #define QEMU_MADV_HUGEPAGE  QEMU_MADV_INVALID
+#define QEMU_MADV_NOHUGEPAGE  QEMU_MADV_INVALID
 
 #endif
 
