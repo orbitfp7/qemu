@@ -4254,6 +4254,7 @@ int main(int argc, char **argv, char **envp)
         exit(1);
     }
 
+    page_size_init();
     socket_init();
 
     if (qemu_opts_foreach(qemu_find_opts("object"),
