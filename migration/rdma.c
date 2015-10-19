@@ -66,13 +66,15 @@
 /*
  * Capabilities for negotiation.
  */
-#define RDMA_CAPABILITY_PIN_ALL 0x01
+#define RDMA_CAPABILITY_PIN_ALL     0x01
+#define RDMA_CAPABILITY_TCP_PARTNER 0x02
 
 /*
  * Add the other flags above to this list of known capabilities
  * as they are introduced.
  */
-static uint32_t known_capabilities = RDMA_CAPABILITY_PIN_ALL;
+static uint32_t known_capabilities = RDMA_CAPABILITY_PIN_ALL |
+                                     RDMA_CAPABILITY_TCP_PARTNER;
 
 #define CHECK_ERROR_STATE() \
     do { \
@@ -297,6 +299,9 @@ typedef struct RDMALocalBlocks {
 typedef struct RDMAContext {
     char *host;
     int port;
+
+    /* Capabilities received from the other side */
+    RDMACapabilities caps;
 
     RDMAWorkRequestData wr_data[RDMA_WRID_MAX];
 
@@ -2331,17 +2336,17 @@ err_rdma_source_init:
 
 static int qemu_rdma_connect(RDMAContext *rdma, Error **errp)
 {
-    RDMACapabilities cap = {
-                                .version = RDMA_CONTROL_VERSION_CURRENT,
-                                .flags = 0,
-                           };
-    struct rdma_conn_param conn_param = { .initiator_depth = 2,
-                                          .retry_count = 5,
-                                          .private_data = &cap,
-                                          .private_data_len = sizeof(cap),
-                                        };
+    struct rdma_conn_param conn_param = {
+        .initiator_depth = 2,
+        .retry_count = 5,
+       .private_data = &rdma->caps,
+        .private_data_len = sizeof(rdma->caps),
+    };
     struct rdma_cm_event *cm_event;
     int ret;
+
+    rdma->caps.version = RDMA_CONTROL_VERSION_CURRENT;
+    rdma->caps.flags = RDMA_CAPABILITY_TCP_PARTNER;
 
     /*
      * Only negotiate the capability with destination if the user
@@ -2349,10 +2354,10 @@ static int qemu_rdma_connect(RDMAContext *rdma, Error **errp)
      */
     if (rdma->pin_all) {
         trace_qemu_rdma_connect_pin_all_requested();
-        cap.flags |= RDMA_CAPABILITY_PIN_ALL;
+        rdma->caps.flags |= RDMA_CAPABILITY_PIN_ALL;
     }
 
-    caps_to_network(&cap);
+    caps_to_network(&rdma->caps);
 
     ret = rdma_connect(rdma->cm_id, &conn_param);
     if (ret) {
@@ -2377,14 +2382,14 @@ static int qemu_rdma_connect(RDMAContext *rdma, Error **errp)
     }
     rdma->connected = true;
 
-    memcpy(&cap, cm_event->param.conn.private_data, sizeof(cap));
-    network_to_caps(&cap);
+    memcpy(&rdma->caps, cm_event->param.conn.private_data, sizeof(rdma->caps));
+    network_to_caps(&rdma->caps);
 
     /*
      * Verify that the *requested* capabilities are supported by the destination
      * and disable them otherwise.
      */
-    if (rdma->pin_all && !(cap.flags & RDMA_CAPABILITY_PIN_ALL)) {
+    if (rdma->pin_all && !(rdma->caps.flags & RDMA_CAPABILITY_PIN_ALL)) {
         ERROR(errp, "Server cannot support pinning all memory. "
                         "Will register memory dynamically.");
         rdma->pin_all = false;
@@ -2791,12 +2796,11 @@ err:
 
 static int qemu_rdma_accept(RDMAContext *rdma)
 {
-    RDMACapabilities cap;
     struct rdma_conn_param conn_param = {
-                                            .responder_resources = 2,
-                                            .private_data = &cap,
-                                            .private_data_len = sizeof(cap),
-                                         };
+        .responder_resources = 2,
+        .private_data = &rdma->caps,
+        .private_data_len = sizeof(rdma->caps),
+    };
     struct rdma_cm_event *cm_event;
     struct ibv_context *verbs;
     int ret = -EINVAL;
@@ -2812,13 +2816,14 @@ static int qemu_rdma_accept(RDMAContext *rdma)
         goto err_rdma_dest_wait;
     }
 
-    memcpy(&cap, cm_event->param.conn.private_data, sizeof(cap));
+    memcpy(&rdma->caps, cm_event->param.conn.private_data, sizeof(rdma->caps));
 
-    network_to_caps(&cap);
+    network_to_caps(&rdma->caps);
 
-    if (cap.version < 1 || cap.version > RDMA_CONTROL_VERSION_CURRENT) {
+    if (rdma->caps.version < 1 ||
+        rdma->caps.version > RDMA_CONTROL_VERSION_CURRENT) {
             error_report("Unknown source RDMA version: %d, bailing...",
-                            cap.version);
+                            rdma->caps.version);
             rdma_ack_cm_event(cm_event);
             goto err_rdma_dest_wait;
     }
@@ -2826,13 +2831,13 @@ static int qemu_rdma_accept(RDMAContext *rdma)
     /*
      * Respond with only the capabilities this version of QEMU knows about.
      */
-    cap.flags &= known_capabilities;
+    rdma->caps.flags &= known_capabilities;
 
     /*
      * Enable the ones that we do know about.
      * Add other checks here as new ones are introduced.
      */
-    if (cap.flags & RDMA_CAPABILITY_PIN_ALL) {
+    if (rdma->caps.flags & RDMA_CAPABILITY_PIN_ALL) {
         rdma->pin_all = true;
     }
 
@@ -2843,7 +2848,7 @@ static int qemu_rdma_accept(RDMAContext *rdma)
 
     trace_qemu_rdma_accept_pin_state(rdma->pin_all);
 
-    caps_to_network(&cap);
+    caps_to_network(&rdma->caps);
 
     trace_qemu_rdma_accept_pin_verbsc(verbs);
 
@@ -2913,6 +2918,8 @@ static int qemu_rdma_accept(RDMAContext *rdma)
     }
 
     qemu_rdma_dump_gid("dest_connect", rdma->cm_id);
+    /* Put our resolved caps back into our byte order for later use */
+    network_to_caps(&rdma->caps);
 
     return 0;
 
