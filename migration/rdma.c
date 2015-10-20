@@ -377,6 +377,14 @@ typedef struct RDMAContext {
     uint64_t unregistrations[RDMA_SIGNALED_SEND_MAX];
 
     GHashTable *blockmap;
+
+    /*
+     * TCP partner connections
+     */
+    /* The fd we listen on for the accept on the destination */
+    int tcp_accept_fd;
+    /* The partner QEMUFile */
+    QEMUFile *tcp_partner;
 } RDMAContext;
 
 /*
@@ -2334,6 +2342,20 @@ err_rdma_source_init:
     return -1;
 }
 
+static void rdma_tcp_partner_connect(int fd, Error *err, void *opaque)
+{
+    RDMAContext *rdma = opaque;
+
+    trace_rdma_tcp_partner_connect(fd);
+    if (fd < 0) {
+        error_report("%s: %s\n", __func__, error_get_pretty(err));
+        error_free(err);
+        /* TODO: Should we fail the RDMA migrate at this point? */
+    } else {
+        rdma->tcp_partner = qemu_fopen_socket(fd, "wb");
+    }
+}
+
 static int qemu_rdma_connect(RDMAContext *rdma, Error **errp)
 {
     struct rdma_conn_param conn_param = {
@@ -2396,8 +2418,21 @@ static int qemu_rdma_connect(RDMAContext *rdma, Error **errp)
     }
 
     trace_qemu_rdma_connect_pin_all_outcome(rdma->pin_all);
-
     rdma_ack_cm_event(cm_event);
+
+    if (rdma->caps.flags & RDMA_CAPABILITY_TCP_PARTNER) {
+        char *host_port = g_malloc(strlen(rdma->host) + 32);
+        /* Note we want a host_port here, not just a port */
+        sprintf(host_port, "%s:%d", rdma->host, rdma->port);
+        inet_nonblocking_connect(host_port, rdma_tcp_partner_connect,
+                                 rdma, errp);
+        if (errp) {
+            g_free(host_port);
+            goto err_rdma_source_connect;
+        }
+        g_free(host_port);
+    }
+
 
     ret = qemu_rdma_post_recv_control(rdma, RDMA_WRID_READY);
     if (ret) {
@@ -2794,6 +2829,46 @@ err:
     return ret;
 }
 
+/* On an incoming migration when the TCP side tries to connect */
+static void rdma_tcp_partner_accept(void *opaque)
+{
+    /* As per tcp_accept_incoming_migration */
+    RDMAContext *rdma = opaque;
+
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    int c, err;
+
+    do {
+        c = qemu_accept(rdma->tcp_accept_fd, (struct sockaddr *)&addr,
+                        &addrlen);
+        err = socket_error();
+    } while (c < 0 && err == EINTR);
+    qemu_set_fd_handler(rdma->tcp_accept_fd, NULL, NULL, NULL);
+    closesocket(rdma->tcp_accept_fd);
+    rdma->tcp_accept_fd = -1;
+
+    trace_rdma_tcp_partner_accept_accepted();
+
+    if (c < 0) {
+        error_report("%s: could not accept (%s)",
+                     __func__, strerror(err));
+        return;
+    }
+
+    rdma->tcp_partner = qemu_fopen_socket(c, "rb");
+    if (rdma->tcp_partner == NULL) {
+        error_report("%s: could not qemu_fopen socket", __func__);
+        goto out;
+    }
+
+    return;
+
+out:
+    closesocket(c);
+
+}
+
 static int qemu_rdma_accept(RDMAContext *rdma)
 {
     struct rdma_conn_param conn_param = {
@@ -2803,6 +2878,7 @@ static int qemu_rdma_accept(RDMAContext *rdma)
     };
     struct rdma_cm_event *cm_event;
     struct ibv_context *verbs;
+    bool need_tcp;
     int ret = -EINVAL;
     int idx;
 
@@ -2840,6 +2916,7 @@ static int qemu_rdma_accept(RDMAContext *rdma)
     if (rdma->caps.flags & RDMA_CAPABILITY_PIN_ALL) {
         rdma->pin_all = true;
     }
+    need_tcp = rdma->caps.flags & RDMA_CAPABILITY_TCP_PARTNER;
 
     rdma->cm_id = cm_event->id;
     verbs = cm_event->id->verbs;
@@ -2890,6 +2967,25 @@ static int qemu_rdma_accept(RDMAContext *rdma)
 
     qemu_set_fd_handler(rdma->channel->fd, NULL, NULL, NULL);
 
+    if (need_tcp) {
+        Error *local_err = NULL;
+        /* Hmm a bit of a hack, we don't have the port string any more */
+        char portstr[32];
+        sprintf(portstr, "%d", rdma->port);
+        /* As per tcp_start_incoming_migration */
+        rdma->tcp_accept_fd = inet_listen(portstr, NULL, 256, SOCK_STREAM,
+                                      0, &local_err);
+        if (rdma->tcp_accept_fd < 0) {
+            error_report("rdma_accept failed to TCP listen: %s",
+                             error_get_pretty(local_err));
+            error_free(local_err);
+            goto err_rdma_dest_wait;
+        }
+        qemu_set_fd_handler(rdma->tcp_accept_fd, rdma_tcp_partner_accept,
+                            NULL, (void *)rdma);
+
+    }
+
     ret = rdma_accept(rdma->cm_id, &conn_param);
     if (ret) {
         error_report("rdma_accept returns %d", ret);
@@ -2909,6 +3005,8 @@ static int qemu_rdma_accept(RDMAContext *rdma)
     }
 
     rdma_ack_cm_event(cm_event);
+    /* TODO: Wait for the TCP connection? is that a yield for it? can it happen before we exit back to main
+       loop anyway ?*/
     rdma->connected = true;
 
     ret = qemu_rdma_post_recv_control(rdma, RDMA_WRID_READY);
@@ -2924,6 +3022,7 @@ static int qemu_rdma_accept(RDMAContext *rdma)
     return 0;
 
 err_rdma_dest_wait:
+    /* TODO: Deal with whether we accepted an incoming TCP connection */
     rdma->error_state = ret;
     qemu_rdma_cleanup(rdma);
     return ret;
