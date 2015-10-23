@@ -2970,17 +2970,20 @@ static int qemu_rdma_accept(RDMAContext *rdma)
     if (need_tcp) {
         Error *local_err = NULL;
         /* Hmm a bit of a hack, we don't have the port string any more */
-        char portstr[32];
-        sprintf(portstr, "%d", rdma->port);
+        /* Note we want a host_port here, not just a port */
+        char *host_port = g_malloc(strlen(rdma->host) + 32);
+        sprintf(host_port, "%s:%d", rdma->host, rdma->port);
         /* As per tcp_start_incoming_migration */
-        rdma->tcp_accept_fd = inet_listen(portstr, NULL, 256, SOCK_STREAM,
+        rdma->tcp_accept_fd = inet_listen(host_port, NULL, 256, SOCK_STREAM,
                                       0, &local_err);
         if (rdma->tcp_accept_fd < 0) {
             error_report("rdma_accept failed to TCP listen: %s",
                              error_get_pretty(local_err));
             error_free(local_err);
+            g_free(host_port);
             goto err_rdma_dest_wait;
         }
+        g_free(host_port);
         qemu_set_fd_handler(rdma->tcp_accept_fd, rdma_tcp_partner_accept,
                             NULL, (void *)rdma);
 
