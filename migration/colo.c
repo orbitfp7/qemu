@@ -21,6 +21,7 @@
 #include "qapi-event.h"
 #include "net/filter.h"
 #include "net/net.h"
+#include "block/block_int.h"
 
 static bool vmstate_loading;
 
@@ -55,6 +56,7 @@ static void secondary_vm_do_failover(void)
 {
     int old_state;
     MigrationIncomingState *mis = migration_incoming_get_current();
+    Error *local_err = NULL;
 
     /* Can not do failover during the process of VM's loading VMstate, Or
       * it will break the secondary VM.
@@ -71,6 +73,12 @@ static void secondary_vm_do_failover(void)
 
     migrate_set_state(&mis->state, MIGRATION_STATUS_COLO,
                       MIGRATION_STATUS_COMPLETED);
+
+    bdrv_stop_replication_all(true, &local_err);
+    if (local_err) {
+        error_report_err(local_err);
+    }
+    trace_colo_stop_block_replication("failover");
 
     if (!autostart) {
         error_report("\"-S\" qemu option will be ignored in secondary side");
@@ -107,6 +115,7 @@ static void primary_vm_do_failover(void)
 {
     MigrationState *s = migrate_get_current();
     int old_state;
+    Error *local_err = NULL;
 
     migrate_set_state(&s->state, MIGRATION_STATUS_COLO,
                       MIGRATION_STATUS_COMPLETED);
@@ -134,6 +143,12 @@ static void primary_vm_do_failover(void)
     qemu_set_default_filters_status(false);
     /* Flush the residuary buffered packts */
     qemu_release_default_filters_packets();
+
+    bdrv_stop_replication_all(true, &local_err);
+    if (local_err) {
+        error_report_err(local_err);
+    }
+    trace_colo_stop_block_replication("failover");
 }
 
 void colo_do_failover(MigrationState *s)
@@ -240,6 +255,7 @@ static int colo_do_checkpoint_transaction(MigrationState *s,
     int colo_shutdown;
     size_t size;
     QEMUFile *trans = NULL;
+    Error *local_err = NULL;
 
     ret = colo_put_cmd(s->to_dst_file, COLO_COMMAND_CHECKPOINT_REQUEST);
     if (ret < 0) {
@@ -274,6 +290,16 @@ static int colo_do_checkpoint_transaction(MigrationState *s,
      * vm_stop_force_state so we check failover_request_is_active() again.
      */
     if (failover_request_is_active()) {
+        ret = -1;
+        goto out;
+    }
+
+    /* we call this api although this may do nothing on primary side */
+    qemu_mutex_lock_iothread();
+    bdrv_do_checkpoint_all(&local_err);
+    qemu_mutex_unlock_iothread();
+    if (local_err) {
+        error_report_err(local_err);
         ret = -1;
         goto out;
     }
@@ -324,6 +350,10 @@ static int colo_do_checkpoint_transaction(MigrationState *s,
     qemu_release_default_filters_packets();
 
     if (colo_shutdown) {
+        qemu_mutex_lock_iothread();
+        bdrv_stop_replication_all(false, NULL);
+        trace_colo_stop_block_replication("shutdown");
+        qemu_mutex_unlock_iothread();
         colo_put_cmd(s->to_dst_file, COLO_COMMAND_GUEST_SHUTDOWN);
         qemu_fflush(s->to_dst_file);
         colo_shutdown_requested = 0;
@@ -378,6 +408,7 @@ static void colo_process_checkpoint(MigrationState *s)
     QEMUSizedBuffer *buffer = NULL;
     int64_t current_time, checkpoint_time = qemu_clock_get_ms(QEMU_CLOCK_HOST);
     int ret = 0;
+    Error *local_err = NULL;
 
     failover_init_state();
     ret = colo_init_buffer_filters();
@@ -414,6 +445,15 @@ static void colo_process_checkpoint(MigrationState *s)
     }
 
     qemu_mutex_lock_iothread();
+    /* start block replication */
+    bdrv_start_replication_all(REPLICATION_MODE_PRIMARY, &local_err);
+    if (local_err) {
+        qemu_mutex_unlock_iothread();
+        error_report_err(local_err);
+        ret = -EINVAL;
+        goto out;
+    }
+    trace_colo_start_block_replication();
     vm_start();
     qemu_mutex_unlock_iothread();
     trace_colo_vm_state_change("stop", "run");
@@ -506,6 +546,8 @@ static int colo_wait_handle_cmd(QEMUFile *f, int *checkpoint_request)
     case COLO_COMMAND_GUEST_SHUTDOWN:
         qemu_mutex_lock_iothread();
         vm_stop_force_state(RUN_STATE_COLO);
+        bdrv_stop_replication_all(false, NULL);
+        trace_colo_stop_block_replication("shutdown");
         qemu_system_shutdown_request_core();
         qemu_mutex_unlock_iothread();
         /* the main thread will exit and termiante the whole
@@ -537,6 +579,7 @@ void *colo_process_incoming_thread(void *opaque)
     uint64_t  total_size;
     int ret = 0;
     uint64_t value;
+    Error *local_err = NULL;
 
     migrate_set_state(&mis->state, MIGRATION_STATUS_ACTIVE,
                       MIGRATION_STATUS_COLO);
@@ -571,6 +614,16 @@ void *colo_process_incoming_thread(void *opaque)
     if (ret < 0) {
         goto out;
     }
+
+    qemu_mutex_lock_iothread();
+    /* start block replication */
+    bdrv_start_replication_all(REPLICATION_MODE_SECONDARY, &local_err);
+    qemu_mutex_unlock_iothread();
+    if (local_err) {
+        error_report_err(local_err);
+        goto out;
+    }
+    trace_colo_start_block_replication();
 
     ret = colo_put_cmd(mis->to_src_file, COLO_COMMAND_CHECKPOINT_READY);
     if (ret < 0) {
@@ -647,6 +700,13 @@ void *colo_process_incoming_thread(void *opaque)
         ret = qemu_load_device_state(fb);
         if (ret < 0) {
             error_report("COLO: load device state failed\n");
+            vmstate_loading = false;
+            qemu_mutex_unlock_iothread();
+            goto out;
+        }
+        /* discard colo disk buffer */
+        bdrv_do_checkpoint_all(&local_err);
+        if (local_err) {
             vmstate_loading = false;
             qemu_mutex_unlock_iothread();
             goto out;
