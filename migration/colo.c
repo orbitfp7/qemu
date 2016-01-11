@@ -19,6 +19,7 @@
 #include "migration/failover.h"
 #include "qapi-event.h"
 #include "net/filter.h"
+#include "net/colo-proxy.h"
 #include "net/net.h"
 #include "block/block_int.h"
 
@@ -378,6 +379,11 @@ static int colo_do_checkpoint_transaction(MigrationState *s,
     qemu_mutex_unlock_iothread();
     trace_colo_vm_state_change("stop", "run");
 
+    ret = colo_proxy_do_checkpoint(COLO_MODE_PRIMARY);
+    if (ret < 0) {
+        goto out;
+    }
+
 out:
     if (local_err) {
         error_report_err(local_err);
@@ -451,6 +457,10 @@ static void colo_process_checkpoint(MigrationState *s)
         goto out;
     }
 
+    ret = colo_proxy_start(COLO_MODE_PRIMARY);
+    if (ret < 0) {
+        goto out;
+    }
     qemu_mutex_lock_iothread();
     /* start block replication */
     bdrv_start_replication_all(REPLICATION_MODE_PRIMARY, &local_err);
@@ -474,6 +484,9 @@ static void colo_process_checkpoint(MigrationState *s)
             goto out;
         }
 
+        if (colo_proxy_query_checkpoint()) {
+            goto checkpoint_begin;
+        }
         current_time = qemu_clock_get_ms(QEMU_CLOCK_HOST);
         if ((current_time - checkpoint_time <
             s->parameters[MIGRATION_PARAMETER_X_CHECKPOINT_DELAY]) &&
@@ -482,8 +495,12 @@ static void colo_process_checkpoint(MigrationState *s)
 
             delay_ms = s->parameters[MIGRATION_PARAMETER_X_CHECKPOINT_DELAY] -
                        (current_time - checkpoint_time);
-            g_usleep(delay_ms * 1000);
+            /*g_usleep(delay_ms * 1000); 
+             * hack from colo upstream dev tree
+             */
+            g_usleep(delay_ms * 10);
         }
+checkpoint_begin:
         /* start a colo checkpoint */
         ret = colo_do_checkpoint_transaction(s, buffer);
         if (ret < 0) {
@@ -512,6 +529,7 @@ out:
     qsb_free(buffer);
     buffer = NULL;
 
+    colo_proxy_stop(COLO_MODE_PRIMARY);
     /* Hope this not to be too long to wait here */
     qemu_sem_wait(&s->colo_sem);
     qemu_sem_destroy(&s->colo_sem);
@@ -639,7 +657,10 @@ void *colo_process_incoming_thread(void *opaque)
     if (local_err) {
         goto out;
     }
-
+    ret = colo_proxy_start(COLO_MODE_SECONDARY);
+    if (ret < 0) {
+        goto out;
+    }
     while (mis->state == MIGRATION_STATUS_COLO) {
         int request;
 
@@ -731,6 +752,10 @@ void *colo_process_incoming_thread(void *opaque)
         if (local_err) {
             goto out;
         }
+        ret = colo_proxy_do_checkpoint(COLO_MODE_SECONDARY);
+        if (ret < 0) {
+            goto out;
+        }
 
         qemu_mutex_lock_iothread();
         vm_start();
@@ -763,6 +788,7 @@ out:
     */
     colo_release_ram_cache();
 
+    colo_proxy_stop(COLO_MODE_SECONDARY);
     /* Hope this not to be too long to loop here */
     qemu_sem_wait(&mis->colo_incoming_sem);
     qemu_sem_destroy(&mis->colo_incoming_sem);
