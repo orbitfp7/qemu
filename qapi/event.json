@@ -255,6 +255,19 @@
   'data': {'status': 'MigrationStatus'}}
 
 ##
+# @MIGRATION_PASS
+#
+# Emitted from the source side of a migration at the start of each pass
+# (when it syncs the dirty bitmap)
+#
+# @pass: An incrementing count (starting at 1 on the first pass)
+#
+# Since: 2.6
+##
+{ 'event': 'MIGRATION_PASS',
+  'data': { 'pass': 'int' } }
+
+##
 # @COLO_EXIT
 #
 # Emitted when VM finishes COLO mode due to some errors happening or
