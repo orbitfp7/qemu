@@ -190,6 +190,27 @@ static inline void colo_proxy_dump_packet(Packet *pkt)
     fprintf(stderr, "\n");
 }
 
+static inline void colo_proxy_dump_headers(const char *prefix, Packet *pkt)
+{
+    char *sdebug = strdup(inet_ntoa(pkt->ip->ip_src));
+    char *ddebug = strdup(inet_ntoa(pkt->ip->ip_dst));
+    struct timeval now;
+
+    gettimeofday(&now, NULL);
+    fprintf(stderr, "%s@%zd.%06zd:(%p) proto: %x size: %d src/dst: %s/%s",
+            prefix, (size_t)now.tv_sec, (size_t)now.tv_usec,
+            pkt, pkt->ip->ip_p, pkt->size, sdebug, ddebug);
+    if (pkt->ip->ip_p == IPPROTO_TCP) {
+        struct tcphdr *tcp = (struct tcphdr *)pkt->transport_layer;
+
+        fprintf(stderr, " port s/d: %d/%d seq/ack=%u/%u flags: %x\n",
+                ntohs(tcp->th_sport), ntohs(tcp->th_dport),
+                ntohl(tcp->th_seq), ntohl(tcp->th_ack), tcp->th_flags);
+    } else {
+        fprintf(stderr, "\n");
+    }
+}
+
 static void info_packet(void *opaque, void *user_data)
 {
     Packet *pkt = opaque;
@@ -299,6 +320,7 @@ static void colo_flush_connection(void *opaque, void *user_data)
     qemu_mutex_lock(&conn->list_lock);
     while (!g_queue_is_empty(&conn->primary_list)) {
         pkt = g_queue_pop_head(&conn->primary_list);
+        /*colo_proxy_dump_headers("PQ>>W", pkt); */
         colo_send_primary_packet(pkt, NULL);
     }
     while (!g_queue_is_empty(&conn->secondary_list)) {
@@ -569,9 +591,9 @@ static void secondary_from_net(NetFilterState *nf,
        conn = colo_proxy_get_conn(s, &key);
         if ((tcp->th_flags & (TH_ACK | TH_SYN)) == TH_ACK) {
             /* Incoming connection, this is the ACK from the outside */
-           fprintf(stderr, "W->G ACK; seqs: %u/%u dst-ip: %s ports (s/d): %d/%d state=%d\n",
-                   ntohl(tcp->th_seq), ntohl(tcp->th_ack), inet_ntoa(key.dst), key.src_port, key.dst_port,
-                   conn->state);
+           //fprintf(stderr, "W->G ACK; seqs: %u/%u dst-ip: %s ports (s/d): %d/%d state=%d\n",
+           //        ntohl(tcp->th_seq), ntohl(tcp->th_ack), inet_ntoa(key.dst), key.src_port, key.dst_port,
+           //        conn->state);
            switch (conn->state) {
            case COLO_CONN_IDLE:
                /* Odd case; we see the response before our seq/ack */
@@ -612,9 +634,9 @@ static void secondary_from_net(NetFilterState *nf,
               * to the syn from the outside.
               */
            conn = colo_proxy_get_conn(s, &key);
-           fprintf(stderr, "G->W SYN-ACK; seqs: %u/%u src-ip: %s ports (s/d): %d/%d state=%d\n",
-                   ntohl(tcp->th_seq), ntohl(tcp->th_ack), inet_ntoa(key.src), key.src_port, key.dst_port,
-                   conn->state);
+           //fprintf(stderr, "G->W SYN-ACK; seqs: %u/%u src-ip: %s ports (s/d): %d/%d state=%d\n",
+           //        ntohl(tcp->th_seq), ntohl(tcp->th_ack), inet_ntoa(key.src), key.src_port, key.dst_port,
+           //        conn->state);
            switch (conn->state) {
            case COLO_CONN_IDLE:
                conn->secondary_seq = ntohl(tcp->th_seq);
@@ -633,9 +655,9 @@ static void secondary_from_net(NetFilterState *nf,
              * the sequence numbers to match the primary.
              */
             conn = colo_proxy_get_conn(s, &key);
-            fprintf(stderr, "G->W; seqs: %u/%u src-ip: %s ports (s/d): %d/%d flags=%x state=%d\n",
-                    ntohl(tcp->th_seq), ntohl(tcp->th_ack), inet_ntoa(key.src), key.src_port, key.dst_port,
-                    tcp->th_flags, conn->state);
+            //fprintf(stderr, "G->W; seqs: %u/%u src-ip: %s ports (s/d): %d/%d flags=%x state=%d\n",
+            //        ntohl(tcp->th_seq), ntohl(tcp->th_ack), inet_ntoa(key.src), key.src_port, key.dst_port,
+            //        tcp->th_flags, conn->state);
 
             if (conn->state == COLO_CONN_SEC_IN_ESTABLISHED) {
                 tcp_seq newseq = ntohl(tcp->th_seq);
@@ -679,6 +701,8 @@ static ssize_t colo_proxy_enqueue_primary_packet(NetFilterState *nf,
     if (!pkt) {
         return 0;
     }
+
+    /* colo_proxy_dump_headers("PG->Q", pkt); */
 
     conn = colo_proxy_get_conn(s, &key);
     if (!conn->processing) {
@@ -1137,6 +1161,7 @@ static void colo_compare_connection(void *opaque, void *user_data)
         qemu_mutex_unlock(&conn->list_lock);
         result = colo_packet_compare(spkt, ppkt);
         if (!result) {
+            /*colo_proxy_dump_headers("PQ=>W", ppkt); */
             colo_send_primary_packet(ppkt, NULL);
             trace_colo_proxy("packet same and release packet");
         } else {
