@@ -429,6 +429,7 @@ static void process_incoming_migration_co(void *opaque)
        runstate_set. */
 
     if (!global_state_received() ||
+        migration_incoming_enable_colo() ||
         global_state_get_runstate() == RUN_STATE_RUNNING) {
         if (autostart) {
             vm_start();
